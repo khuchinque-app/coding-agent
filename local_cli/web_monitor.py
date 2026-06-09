@@ -12,7 +12,6 @@ Usage::
 
 import http.server
 import json
-import os
 import queue
 import threading
 from typing import Any
@@ -20,30 +19,9 @@ from typing import Any
 from local_cli.config import Config
 from local_cli.model_presets import SUPPORTS_THINKING, get_model_family, get_model_preset
 from local_cli.providers import LLMProvider, ProviderConnectionError, ProviderRequestError, ProviderStreamError
+from local_cli.prompts import build_system_prompt
 from local_cli.tools import get_default_tools
 from local_cli.tools.base import Tool
-
-
-def _build_system_prompt(tools: list[Tool]) -> str:
-    tool_lines = [f"- {t.name}: {t.description}" for t in tools]
-    cwd = os.getcwd()
-    return (
-        "You are a coding agent. Complete tasks by using tools.\n\n"
-        f"WORKING DIRECTORY: {cwd}\n\n"
-        "AVAILABLE TOOLS:\n" + "\n".join(tool_lines) + "\n\n"
-        "RULES:\n"
-        "1. ALWAYS use tools. Never output code as markdown.\n"
-        "2. Use write to create files, bash to run them.\n"
-        "3. If code has errors, fix by rewriting and re-running.\n"
-        "4. Read files before editing.\n"
-        "5. Verify changes by reading back or running tests.\n"
-        "\n"
-        "TASK TRACKING:\n"
-        "For multi-step tasks (3+ steps) or multiple deliverables (e.g., 'make 10 games'),\n"
-        "use todo_write to maintain a checklist. Mark one task 'in_progress' at a time and\n"
-        "move to 'completed' immediately after finishing. Don't stop until all are done.\n"
-        "When making multiple items, check your todo list to avoid repetition.\n"
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -452,7 +430,7 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             self.session_messages.clear()
             self.session_messages.append({
                 "role": "system",
-                "content": _build_system_prompt(self.tools),
+                "content": build_system_prompt(self.tools),
             })
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -498,7 +476,7 @@ def run_web_monitor(config: Config | None = None, port: int = 7070) -> None:
     _Handler.tool_map = tool_map
     _Handler.event_queue = queue.Queue()
     _Handler.session_messages = [
-        {"role": "system", "content": _build_system_prompt(tools)},
+        {"role": "system", "content": build_system_prompt(tools)},
     ]
 
     server = http.server.HTTPServer(("0.0.0.0", port), _Handler)
