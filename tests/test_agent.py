@@ -1970,6 +1970,17 @@ class TestShouldNudgeToUseTools(unittest.TestCase):
         asst = {"role": "assistant", "content": "```python\nprint(1)\n```"}
         self.assertTrue(_should_nudge_to_use_tools(msgs, asst, False))
 
+    def test_substring_false_positive_suppressed(self) -> None:
+        # "address" contains "add", "prefix" contains "fix" — must NOT nudge.
+        msgs = self._user("explain the address parsing in this prefix code")
+        asst = {"role": "assistant", "content": "```python\nx=1\n```"}
+        self.assertFalse(_should_nudge_to_use_tools(msgs, asst, False))
+
+    def test_whole_word_keyword_still_fires(self) -> None:
+        msgs = self._user("fix the bug in main")
+        asst = {"role": "assistant", "content": "```python\nx=1\n```"}
+        self.assertTrue(_should_nudge_to_use_tools(msgs, asst, False))
+
 
 class TestAgentLoopNudge(unittest.TestCase):
     """Integration: agent_loop nudges once on a code-only build answer."""

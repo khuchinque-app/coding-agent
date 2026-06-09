@@ -7,6 +7,7 @@ tokens arrive.
 """
 
 import json
+import re
 import sys
 import time
 from typing import Any, Generator
@@ -768,14 +769,36 @@ def compact_messages(
 # "Use the tools" nudge
 # ---------------------------------------------------------------------------
 
-# Words in the user's request that imply a file should actually be written
-# or changed (English + common Japanese stems).  Used to decide whether a
-# code-only answer warrants a nudge to use the tools.
-_BUILD_KEYWORDS: frozenset[str] = frozenset({
+# English build/edit verbs, matched as whole words so "add" does not fire on
+# "address" nor "fix" on "prefix".
+_BUILD_KEYWORDS_EN: frozenset[str] = frozenset({
     "create", "write", "make", "build", "implement", "generate",
     "add", "fix", "refactor", "edit", "modify", "save", "rename",
-    "作", "書", "実装", "追加", "修正", "生成", "直",
 })
+
+# Japanese stems, matched as substrings (Japanese is not whitespace-delimited).
+_BUILD_KEYWORDS_JA: tuple[str, ...] = (
+    "作", "書", "実装", "追加", "修正", "生成", "直",
+)
+
+
+def _mentions_build_intent(user_text: str) -> bool:
+    """Whether the user's request implies a file should be written or changed.
+
+    English verbs match on whole words to avoid false positives like
+    "address" (contains "add") or "prefix" (contains "fix"); Japanese stems
+    match as substrings since Japanese has no word boundaries.
+
+    Args:
+        user_text: The most recent user message text.
+
+    Returns:
+        True if the request mentions a build/edit intent.
+    """
+    if any(stem in user_text for stem in _BUILD_KEYWORDS_JA):
+        return True
+    words = set(re.findall(r"[a-z]+", user_text.lower()))
+    return bool(words & _BUILD_KEYWORDS_EN)
 
 
 def _last_user_text(messages: list[dict[str, Any]]) -> str:
@@ -821,8 +844,7 @@ def _should_nudge_to_use_tools(
     content = assistant_message.get("content", "") or ""
     if "```" not in content:
         return False
-    user_text = _last_user_text(messages).lower()
-    if not any(kw in user_text for kw in _BUILD_KEYWORDS):
+    if not _mentions_build_intent(_last_user_text(messages)):
         return False
     if _wrote_file_this_turn(messages):
         return False
