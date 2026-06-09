@@ -6,10 +6,9 @@ with ``new_text``, and writes the result back.  Returns a diff-like
 output showing the changes made.
 """
 
-import os
-import tempfile
 from pathlib import Path
 
+from local_cli.tools._fileio import atomic_write_text
 from local_cli.tools.base import Tool
 
 
@@ -42,44 +41,6 @@ def _make_diff_output(
         parts.append(f"+{line}")
 
     return "\n".join(parts)
-
-
-def _atomic_write(path: Path, content: str) -> None:
-    """Write *content* to *path* atomically (temp file + rename).
-
-    The new content is written to a sibling temp file which is then
-    ``os.replace``-d into place, so a failure mid-write leaves the original
-    file intact rather than half-written.  The original file's permission
-    bits are preserved across the replacement.
-
-    Args:
-        path: Destination file path.
-        content: Text to write.
-    """
-    try:
-        orig_mode: int | None = path.stat().st_mode
-    except OSError:
-        orig_mode = None
-
-    fd, tmp_name = tempfile.mkstemp(
-        dir=str(path.parent), prefix=".edit-", suffix=".tmp",
-    )
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write(content)
-        if orig_mode is not None:
-            try:
-                os.chmod(tmp_name, orig_mode)
-            except OSError:
-                pass
-        os.replace(tmp_name, str(path))
-    except BaseException:
-        # Clean up the temp file on any failure (including the rename).
-        try:
-            os.unlink(tmp_name)
-        except OSError:
-            pass
-        raise
 
 
 class EditTool(Tool):
@@ -205,7 +166,7 @@ class EditTool(Tool):
         # Write the modified content back atomically so a failure mid-write
         # cannot leave the file truncated or corrupted.
         try:
-            _atomic_write(path, new_content)
+            atomic_write_text(path, new_content)
         except PermissionError:
             return f"Error: permission denied: {file_path}"
         except OSError as exc:

@@ -8,6 +8,7 @@ paths to prevent directory traversal attacks.
 import os
 from pathlib import Path
 
+from local_cli.tools._fileio import atomic_write_text
 from local_cli.tools.base import Tool
 
 
@@ -123,9 +124,10 @@ class WriteTool(Tool):
         except OSError as exc:
             return f"Error: could not create parent directories: {exc}"
 
-        # Write the file.
+        # Write the file atomically (temp file + rename) so a failure
+        # mid-write cannot truncate an existing file.
         try:
-            path.write_text(content, encoding="utf-8")
+            atomic_write_text(path, content)
         except PermissionError:
             return f"Error: permission denied: {file_path}"
         except OSError as exc:
