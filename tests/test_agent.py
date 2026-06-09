@@ -23,6 +23,7 @@ from local_cli.agent import (
     collect_streaming_response,
     compact_messages,
     parse_tool_call,
+    resolve_tool_name,
     run_tool,
 )
 from local_cli.ollama_client import OllamaStreamError

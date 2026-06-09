@@ -393,21 +393,92 @@ def parse_tool_call(
     return tool_name, arguments, tc.get("id")
 
 
+# Aliases local models commonly emit for the built-in tools.  Small models
+# frequently call a tool by a near-miss name (write_file vs write, run vs
+# bash); resolving these instead of erroring keeps the agent moving.  Keys
+# are normalized (lowercased, separators stripped) — see resolve_tool_name.
+_TOOL_ALIASES: dict[str, str] = {
+    "writefile": "write", "createfile": "write", "newfile": "write",
+    "savefile": "write", "putfile": "write",
+    "readfile": "read", "openfile": "read", "viewfile": "read",
+    "cat": "read", "view": "read", "open": "read",
+    "editfile": "edit", "replace": "edit", "strreplace": "edit",
+    "modify": "edit", "update": "edit", "replaceinfile": "edit",
+    "run": "bash", "shell": "bash", "exec": "bash", "execute": "bash",
+    "runcommand": "bash", "bashcommand": "bash", "command": "bash",
+    "sh": "bash", "terminal": "bash", "runshell": "bash",
+    "search": "grep", "searchfiles": "grep", "findinfiles": "grep",
+    "ripgrep": "grep", "rg": "grep", "searchcode": "grep",
+    "find": "glob", "findfiles": "glob", "listfiles": "glob",
+    "ls": "glob", "globfiles": "glob", "listdir": "glob",
+    "fetch": "web_fetch", "fetchurl": "web_fetch", "curl": "web_fetch",
+    "wget": "web_fetch", "httpget": "web_fetch", "geturl": "web_fetch",
+    "todo": "todo_write", "todos": "todo_write", "tasklist": "todo_write",
+    "writetodo": "todo_write", "updatetodo": "todo_write",
+    "ask": "ask_user", "question": "ask_user", "prompt": "ask_user",
+    "askquestion": "ask_user",
+    "spawn": "agent", "subagent": "agent", "spawnagent": "agent",
+    "delegate": "agent",
+}
+
+
+def _normalize_tool_name(name: str) -> str:
+    """Lowercase *name* and strip non-alphanumerics (``write_file`` -> ``writefile``)."""
+    return "".join(c for c in name.lower() if c.isalnum())
+
+
+def resolve_tool_name(
+    tool_name: str, tool_map: dict[str, Tool],
+) -> str | None:
+    """Resolve a possibly-misnamed tool to a real key in *tool_map*.
+
+    Local models routinely emit near-miss tool names.  This tries, in order:
+    an exact match; a known alias; a match after normalizing case and
+    separators (so ``write_file`` / ``WriteFile`` map to ``write``); and an
+    alias of the normalized form.  Returns ``None`` when nothing matches, so
+    a genuinely unknown tool still surfaces as an error.
+
+    Args:
+        tool_name: The (possibly imperfect) name the model emitted.
+        tool_map: Mapping of real tool name to :class:`Tool` instance.
+
+    Returns:
+        A key present in *tool_map*, or ``None``.
+    """
+    if tool_name in tool_map:
+        return tool_name
+
+    norm = _normalize_tool_name(tool_name)
+
+    # A direct alias on the raw-lowered name or the normalized form.
+    for candidate in (_TOOL_ALIASES.get(tool_name.lower()), _TOOL_ALIASES.get(norm)):
+        if candidate and candidate in tool_map:
+            return candidate
+
+    # Match by normalized form against the real tool names.
+    for real in tool_map:
+        if _normalize_tool_name(real) == norm:
+            return real
+
+    return None
+
+
 def run_tool(
     tool_name: str,
     arguments: dict[str, Any],
     tool_map: dict[str, Tool],
     debug: bool = False,
 ) -> str:
-    """Resolve *tool_name* in *tool_map* and execute it.
+    """Resolve *tool_name* (with alias/fuzzy fallback) and execute it.
 
-    Returns an ``Error: unknown tool`` string for an unrecognized name and
-    routes execution through :func:`_execute_tool`, so exceptions are
-    converted to error strings uniformly across every front-end (CLI agent
-    loop, sub-agent loop, JSON-line server, web monitor).
+    Returns an ``Error: unknown tool`` string only for a name that can't be
+    resolved even after alias/normalization fallback, and routes execution
+    through :func:`_execute_tool`, so exceptions are converted to error
+    strings uniformly across every front-end (CLI agent loop, sub-agent
+    loop, JSON-line server, web monitor).
 
     Args:
-        tool_name: The name of the tool to run.
+        tool_name: The name of the tool to run (may be a near-miss).
         arguments: Keyword arguments for the tool.
         tool_map: Mapping of tool name to :class:`Tool` instance.
         debug: Forwarded to :func:`_execute_tool`.
@@ -415,10 +486,10 @@ def run_tool(
     Returns:
         The tool result string, or an ``Error: ...`` message.
     """
-    tool = tool_map.get(tool_name)
-    if tool is None:
+    resolved = resolve_tool_name(tool_name, tool_map)
+    if resolved is None:
         return f"Error: unknown tool '{tool_name}'"
-    return _execute_tool(tool, arguments, debug=debug)
+    return _execute_tool(tool_map[resolved], arguments, debug=debug)
 
 
 # Max characters of a tool result forwarded to a GUI front-end (the
@@ -796,6 +867,7 @@ def agent_loop(
         # ---------------------------------------------------------------
         for tc in tool_calls:
             tool_name, arguments, tool_call_id = parse_tool_call(tc)
+            tool_name = resolve_tool_name(tool_name, tool_map) or tool_name
 
             tool = tool_map.get(tool_name)
             if tool is None:
@@ -1059,6 +1131,7 @@ def sub_agent_loop(
         # ---------------------------------------------------------------
         for tc in tool_calls:
             tool_name, arguments, tool_call_id = parse_tool_call(tc)
+            tool_name = resolve_tool_name(tool_name, tool_map) or tool_name
 
             tool = tool_map.get(tool_name)
             if tool is None:
