@@ -286,5 +286,62 @@ class TestEditToolParameterValidation(unittest.TestCase):
         self.assertEqual(content, "xyz abc abc\n")
 
 
+class TestEditToolLineEndingFallback(unittest.TestCase):
+    """Tests for the CRLF/LF normalization fallback."""
+
+    def test_lf_old_text_matches_crlf_file(self) -> None:
+        """old_text emitted with LF matches a file stored with CRLF."""
+        fd, path = tempfile.mkstemp(suffix=".txt")
+        os.close(fd)
+        try:
+            with open(path, "w", newline="") as f:
+                f.write("line one\r\nline two\r\nline three\r\n")
+            result = EditTool().execute(
+                file_path=path,
+                old_text="line one\nline two",
+                new_text="line one\nLINE TWO",
+            )
+            self.assertNotIn("not found", result)
+            with open(path, encoding="utf-8") as f:
+                self.assertIn("LINE TWO", f.read())
+        finally:
+            os.unlink(path)
+
+    def test_genuinely_missing_text_still_errors(self) -> None:
+        """Text absent even after normalization still returns not-found."""
+        fd, path = tempfile.mkstemp(suffix=".txt")
+        os.close(fd)
+        try:
+            with open(path, "w") as f:
+                f.write("hello world\n")
+            result = EditTool().execute(
+                file_path=path, old_text="nonexistent xyz", new_text="q",
+            )
+            self.assertIn("not found", result)
+        finally:
+            os.unlink(path)
+
+
+class TestEditToolAtomicWrite(unittest.TestCase):
+    """Tests for atomic-write behavior (permission preservation)."""
+
+    def test_preserves_file_mode(self) -> None:
+        """An edit preserves the file's permission bits."""
+        import stat as _stat
+        fd, path = tempfile.mkstemp(suffix=".sh")
+        os.close(fd)
+        try:
+            with open(path, "w") as f:
+                f.write("echo hi\n")
+            os.chmod(path, 0o755)
+            EditTool().execute(file_path=path, old_text="hi", new_text="bye")
+            mode = _stat.S_IMODE(os.stat(path).st_mode)
+            self.assertEqual(mode, 0o755)
+            with open(path, encoding="utf-8") as f:
+                self.assertIn("bye", f.read())
+        finally:
+            os.unlink(path)
+
+
 if __name__ == "__main__":
     unittest.main()
