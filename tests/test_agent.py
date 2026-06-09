@@ -2010,5 +2010,49 @@ class TestAgentLoopNudge(unittest.TestCase):
         self.assertEqual(client.chat_stream.call_count, 1)
 
 
+class TestAgentLoopAliasIntegration(unittest.TestCase):
+    """End-to-end: a near-miss tool name + alias arg keys still write a file.
+
+    agent_loop dispatches via its own cache path (not run_tool), so this
+    verifies that resolve_tool_name + normalize_arguments are correctly
+    wired into the loop and a real WriteTool actually runs.
+    """
+
+    def test_near_miss_write_actually_writes_file(self) -> None:
+        import os
+        import tempfile
+
+        from local_cli.tools.write_tool import WriteTool
+
+        fd, path = tempfile.mkstemp(suffix=".txt")
+        os.close(fd)
+        try:
+            # The model emits a near-miss name ("write_file") and alias arg
+            # keys ("path"/"text") rather than write / file_path / content.
+            tc = [{
+                "function": {
+                    "name": "write_file",
+                    "arguments": {"path": path, "text": "hello from alias"},
+                },
+                "id": "c1",
+            }]
+            client = MagicMock()
+            client.chat_stream.side_effect = [
+                iter(_make_chunks([""], tool_calls=tc)),
+                iter(_make_chunks(["done"])),
+            ]
+
+            messages: list[dict[str, Any]] = [
+                {"role": "user", "content": "write the file"},
+            ]
+            agent_loop(client, "m", [WriteTool()], messages)
+
+            with open(path, encoding="utf-8") as f:
+                self.assertEqual(f.read(), "hello from alias")
+        finally:
+            if os.path.exists(path):
+                os.unlink(path)
+
+
 if __name__ == "__main__":
     unittest.main()
