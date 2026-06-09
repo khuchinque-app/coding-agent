@@ -127,9 +127,13 @@ class GrepTool(Tool):
             if not file_path.is_file():
                 continue
 
-            # Skip binary files by checking for null bytes.
+            # Skip binary files by checking for null bytes.  Read only the
+            # first 8KB, not the whole file -- this runs for every file in
+            # the tree, so loading each one entirely would waste memory (and
+            # risk OOM) on large files.
             try:
-                raw = file_path.read_bytes()[:8192]
+                with file_path.open("rb") as fh:
+                    raw = fh.read(8192)
             except (PermissionError, OSError):
                 continue
 
