@@ -5,8 +5,12 @@ and :func:`run_repl` for the interactive read-eval-print loop.
 """
 
 import argparse
+import json
+import os
 import readline  # noqa: F401 — imported for side-effect (line editing/history)
 import sys
+from datetime import datetime, timezone
+from pathlib import Path
 
 from local_cli import __version__
 from local_cli.agent import (
@@ -33,7 +37,43 @@ from local_cli.ollama_client import OllamaClient, OllamaConnectionError
 from local_cli.plan_manager import PlanError, PlanManager, PlanNotFoundError
 from local_cli.prompts import build_system_prompt
 from local_cli.session import SessionManager
+from local_cli.session_memory import SessionMemory
+from local_cli.identity import IdentityLoader
+from local_cli.memory_proposals import (
+    MemoryError,
+    MemoryProposalManager,
+    MemoryProposalNotFoundError,
+)
 from local_cli.skills import SkillsLoader
+from local_cli.skill_proposals import (
+    SkillFileError,
+    SkillProposalError,
+    SkillProposalManager,
+    SkillProposalNotFoundError,
+    SkillProposalInvalidStatusError,
+)
+from local_cli.self_heal import SelfHealEngine, get_project_structure
+from local_cli.self_improvement import (
+    ImprovementError,
+    ImprovementProposalManager,
+    ImprovementProposalNotFoundError,
+    ImprovementProposalInvalidStatusError,
+    InvalidTargetError,
+    NudgeEngine,
+)
+from local_cli.stat import (
+    _AMBER,
+    _BOLD,
+    _CYAN,
+    _GRAY,
+    _GREEN,
+    _ORANGE,
+    _RED,
+    _RESET,
+    _YELLOW,
+    get_controller,
+    get_status,
+)
 from local_cli.tools.base import Tool
 
 # ---------------------------------------------------------------------------
@@ -41,6 +81,12 @@ from local_cli.tools.base import Tool
 # ---------------------------------------------------------------------------
 
 _SLASH_COMMANDS: dict[str, str] = {
+    "/identity": "Show loaded identity files (SOUL.md, USER.md, etc.) status.",
+    "/memory": "Manage memory proposals — propose, approve, reject, list, show, edit.",
+    "/queue <cmd>": "Queue command to run after current agent finishes.",
+    "/bg <cmd>": "Run command in background mode.",
+    "/stop": "Stop the running agent.",
+    "/interview": "Start interview mode — AI asks questions about your project.",
     "/help": "Show this help message.",
     "/exit": "Exit the REPL.",
     "/quit": "Exit the REPL (alias for /exit).",
@@ -68,7 +114,14 @@ _SLASH_COMMANDS: dict[str, str] = {
     "/plan": "Show, create, or update plans.",
     "/ideate": "Enter ideation (brainstorming) mode.",
     "/knowledge": "Save, load, or list knowledge items.",
-    "/skills": "List or show discovered skills.",
+    "/skills": "Manage skills — list, show, propose, approve, reject, review, delete.",
+    "/session": "Show session memory contents (tool history, temp dir). Use /session clear to reset.",
+    "/nudge": "Show startup-style nudges (pending proposals, missing files, etc.).",
+    "/improve": "Manage improvement proposals for identity files — propose, list, approve, reject.",
+    "/heal": "Self-heal: scan codebase for bugs, detect issues, and attempt auto-fixes with git rollback safety.",
+    "/structure [depth]": "Show the current project directory tree (optional depth, default 3).",
+    "/log": "Show recent session logs (for debugging). Use /log <N> to show last N log entries.",
+    "/plan big": "Show a big-picture overview of all plans with progress bars and status.",
 }
 
 
@@ -94,6 +147,8 @@ class _ReplContext:
         plan_manager: Optional plan manager for plan CRUD operations.
         knowledge_store: Optional knowledge store for persistent knowledge.
         skills_loader: Optional skills loader for auto-discovered skills.
+        identity_loader: Optional identity loader for SOUL.md/USER.md etc.
+        memory_proposal_manager: Optional memory proposal manager.
         ideation_engine: Optional ideation engine for brainstorming mode.
         active_plan_id: ID of the currently active plan (or None).
         current_mode: Current REPL mode ('agent' or 'ideate').
@@ -107,6 +162,8 @@ class _ReplContext:
         "messages",
         "session_manager",
         "system_prompt",
+        "identity_loader",
+        "memory_proposal_manager",
         "rag_engine",
         "rag_topk",
         "git_ops",
@@ -117,11 +174,15 @@ class _ReplContext:
         "sub_agent_runner",
         "plan_manager",
         "knowledge_store",
+        "skill_proposal_manager",
         "skills_loader",
+        "improvement_proposal_manager",
+        "nudge_engine",
         "ideation_engine",
         "active_plan_id",
         "current_mode",
         "ideation_messages",
+        "session_memory",
     )
 
     def __init__(
@@ -132,6 +193,9 @@ class _ReplContext:
         messages: list[dict],
         session_manager: SessionManager,
         system_prompt: str,
+        identity_loader: IdentityLoader | None = None,
+        memory_proposal_manager: MemoryProposalManager | None = None,
+        skill_proposal_manager: SkillProposalManager | None = None,
         rag_engine: object | None = None,
         rag_topk: int = 5,
         orchestrator: object | None = None,
@@ -142,6 +206,8 @@ class _ReplContext:
         plan_manager: PlanManager | None = None,
         knowledge_store: KnowledgeStore | None = None,
         skills_loader: SkillsLoader | None = None,
+        improvement_proposal_manager: ImprovementProposalManager | None = None,
+        nudge_engine: NudgeEngine | None = None,
         ideation_engine: IdeationEngine | None = None,
     ) -> None:
         self.config = config
@@ -150,6 +216,11 @@ class _ReplContext:
         self.messages = messages
         self.session_manager = session_manager
         self.system_prompt = system_prompt
+        self.identity_loader = identity_loader
+        self.memory_proposal_manager = memory_proposal_manager
+        self.skill_proposal_manager = skill_proposal_manager
+        self.improvement_proposal_manager = improvement_proposal_manager
+        self.nudge_engine = nudge_engine
         self.rag_engine = rag_engine
         self.rag_topk = rag_topk
         self.git_ops = GitOps()
@@ -165,6 +236,7 @@ class _ReplContext:
         self.active_plan_id: str | None = None
         self.current_mode: str = "agent"
         self.ideation_messages: list[dict] = []
+        self.session_memory: SessionMemory | None = None
 
 
 def _handle_slash_command(command: str, ctx: _ReplContext) -> bool:
@@ -183,14 +255,15 @@ def _handle_slash_command(command: str, ctx: _ReplContext) -> bool:
 
     # -- /exit, /quit -------------------------------------------------------
     if cmd in ("/exit", "/quit"):
-        print("Goodbye!")
+        print(f"{_RED}Goodbye!{_RESET}")
         return False
 
     # -- /help --------------------------------------------------------------
     if cmd == "/help":
-        print("\nAvailable commands:")
+        print(f"\n{_RED}{_BOLD}Available commands:{_RESET}")
         for name, description in _SLASH_COMMANDS.items():
-            print(f"  {name:<20} {description}")
+            cmd_color = _AMBER if name.startswith("/heal") or name.startswith("/structure") else _ORANGE
+            print(f"  {cmd_color}{name:<20}{_RESET} {description}")
         print()
         return True
 
@@ -198,13 +271,13 @@ def _handle_slash_command(command: str, ctx: _ReplContext) -> bool:
     if cmd == "/clear":
         ctx.messages.clear()
         ctx.messages.append({"role": "system", "content": ctx.system_prompt})
-        print("Conversation history cleared.")
+        print(f"{_GREEN}✓{_RESET} Conversation history cleared.")
         return True
 
     # -- /model <name> ------------------------------------------------------
     if cmd == "/model":
         if len(parts) < 2 or not parts[1].strip():
-            print("Usage: /model <name>")
+            print(f"{_ORANGE}Usage:{_RESET} /model <name>")
             return True
 
         new_model = parts[1].strip()
@@ -218,16 +291,16 @@ def _handle_slash_command(command: str, ctx: _ReplContext) -> bool:
                 for name in model_names
             )
             if not model_found:
-                print(f"Model '{new_model}' not found on Ollama server.")
+                print(f"{_RED}✖{_RESET} Model '{_AMBER}{new_model}{_RESET}' not found on Ollama server.")
                 if model_names:
-                    print(f"Available models: {', '.join(model_names)}")
+                    print(f"  Available: {_GRAY}{', '.join(model_names)}{_RESET}")
                 return True
         except OllamaConnectionError:
-            print("Warning: could not connect to Ollama to validate model.")
-            print(f"Switching to '{new_model}' anyway.")
+            print(f"{_YELLOW}⚠{_RESET} Warning: could not connect to Ollama to validate model.")
+            print(f"  Switching to '{new_model}' anyway.")
 
         ctx.config.model = new_model
-        print(f"Switched to model: {new_model}")
+        print(f"{_GREEN}✓{_RESET} Switched to model: {_AMBER}{new_model}{_RESET}")
         return True
 
     # -- /status ------------------------------------------------------------
@@ -236,21 +309,22 @@ def _handle_slash_command(command: str, ctx: _ReplContext) -> bool:
         user_msg_count = sum(
             1 for m in ctx.messages if m.get("role") == "user"
         )
-        print(f"\nModel: {ctx.config.model}")
-        print(f"Messages: {user_msg_count}")
-        print(f"Mode: {ctx.current_mode}")
+        print(f"\n{_AMBER}⚡ {_BOLD}Model:{_RESET}     {ctx.config.model}")
+        print(f"{_YELLOW}💬 {_BOLD}Messages:{_RESET}   {user_msg_count}")
+        mode_color = _CYAN if ctx.current_mode == "agent" else _ORANGE
+        print(f"{mode_color}◈ {_BOLD}Mode:{_RESET}       {ctx.current_mode}")
 
         # Show active plan if any.
         if ctx.active_plan_id is not None:
-            print(f"Active plan: {ctx.active_plan_id}")
+            print(f"{_ORANGE}⊘ {_BOLD}Active plan:{_RESET} {ctx.active_plan_id}")
 
         # Check Ollama connection status.
         try:
             version_info = ctx.client.get_version()
             version = version_info.get("version", "unknown")
-            print(f"Ollama: connected (v{version})")
+            print(f"{_GREEN}● {_BOLD}Ollama:{_RESET}     connected (v{version})")
         except OllamaConnectionError:
-            print("Ollama: disconnected")
+            print(f"{_RED}● {_BOLD}Ollama:{_RESET}     {_RED}DISCONNECTED{_RESET}")
 
         print()
         return True
@@ -263,18 +337,18 @@ def _handle_slash_command(command: str, ctx: _ReplContext) -> bool:
             result = select_model_interactive(ctx.client, ctx.config.model)
             if result is not None:
                 ctx.config.model = result
-                print(f"Switched to model: {result}")
+                print(f"{_GREEN}✓{_RESET} Switched to model: {_AMBER}{result}{_RESET}")
         except Exception as exc:
-            print(f"Model selection failed: {exc}")
+            print(f"{_RED}✖{_RESET} Model selection failed: {exc}")
         return True
 
     # -- /save --------------------------------------------------------------
     if cmd == "/save":
         try:
             session_id = ctx.session_manager.save_session(ctx.messages)
-            print(f"Session saved: {session_id}")
+            print(f"{_GREEN}✓{_RESET} Session saved: {_AMBER}{session_id}{_RESET}")
         except OSError as exc:
-            print(f"Failed to save session: {exc}")
+            print(f"{_RED}✖{_RESET} Failed to save session: {exc}")
         return True
 
     # -- /checkpoint --------------------------------------------------------
@@ -283,21 +357,21 @@ def _handle_slash_command(command: str, ctx: _ReplContext) -> bool:
         checkpoint_msg = parts[1].strip() if len(parts) > 1 else ""
         try:
             if not ctx.git_ops.is_git_repo():
-                print("Not a git repository. Cannot create checkpoint.")
+                print(f"{_YELLOW}⚠{_RESET} Not a git repository. Cannot create checkpoint.")
                 return True
             tag = ctx.git_ops.create_checkpoint(checkpoint_msg)
-            print(f"Checkpoint created: {tag}")
+            print(f"{_GREEN}✓{_RESET} Checkpoint created: {_AMBER}{tag}{_RESET}")
         except GitNotInstalledError:
-            print("git is not installed. Cannot create checkpoint.")
+            print(f"{_RED}✖{_RESET} git is not installed. Cannot create checkpoint.")
         except GitError as exc:
-            print(f"Checkpoint failed: {exc}")
+            print(f"{_RED}✖{_RESET} Checkpoint failed: {exc}")
         return True
 
     # -- /rollback [tag] ----------------------------------------------------
     if cmd == "/rollback":
         try:
             if not ctx.git_ops.is_git_repo():
-                print("Not a git repository. Cannot rollback.")
+                print(f"{_YELLOW}⚠{_RESET} Not a git repository. Cannot rollback.")
                 return True
 
             # Determine which tag to roll back to.
@@ -307,54 +381,54 @@ def _handle_slash_command(command: str, ctx: _ReplContext) -> bool:
                 # Use the most recent checkpoint.
                 checkpoints = ctx.git_ops.list_checkpoints()
                 if not checkpoints:
-                    print("No checkpoints found. Use /checkpoint first.")
+                    print(f"{_YELLOW}⚠{_RESET} No checkpoints found. Use /checkpoint first.")
                     return True
                 target_tag = checkpoints[0]
 
             ctx.git_ops.rollback_to_checkpoint(target_tag)
-            print(f"Rolled back to checkpoint: {target_tag}")
+            print(f"{_GREEN}✓{_RESET} Rolled back to checkpoint: {_AMBER}{target_tag}{_RESET}")
         except GitNotInstalledError:
-            print("git is not installed. Cannot rollback.")
+            print(f"{_RED}✖{_RESET} git is not installed. Cannot rollback.")
         except GitError as exc:
-            print(f"Rollback failed: {exc}")
+            print(f"{_RED}✖{_RESET} Rollback failed: {exc}")
         return True
 
     # -- /undo --------------------------------------------------------------
     if cmd == "/undo":
         try:
             if not ctx.git_ops.is_git_repo():
-                print("Not a git repository. Cannot undo.")
+                print(f"{_YELLOW}⚠{_RESET} Not a git repository. Cannot undo.")
                 return True
             result = ctx.git_ops.undo_last_change()
             print(result)
         except GitNotInstalledError:
-            print("git is not installed. Cannot undo.")
+            print(f"{_RED}✖{_RESET} git is not installed. Cannot undo.")
         except GitError as exc:
-            print(f"Undo failed: {exc}")
+            print(f"{_RED}✖{_RESET} Undo failed: {exc}")
         return True
 
     # -- /diff --------------------------------------------------------------
     if cmd == "/diff":
         try:
             if not ctx.git_ops.is_git_repo():
-                print("Not a git repository. Cannot show diff.")
+                print(f"{_YELLOW}⚠{_RESET} Not a git repository. Cannot show diff.")
                 return True
             result = ctx.git_ops.diff_working_tree()
             print(result)
         except GitNotInstalledError:
-            print("git is not installed. Cannot show diff.")
+            print(f"{_RED}✖{_RESET} git is not installed. Cannot show diff.")
         except GitError as exc:
-            print(f"Diff failed: {exc}")
+            print(f"{_RED}✖{_RESET} Diff failed: {exc}")
         return True
 
     # -- /install <model> ---------------------------------------------------
     if cmd == "/install":
         if len(parts) < 2 or not parts[1].strip():
-            print("Usage: /install <model>")
+            print(f"{_ORANGE}Usage:{_RESET} /install <model>")
             return True
 
         if ctx.model_manager is None:
-            print("Model management not available.")
+            print(f"{_YELLOW}⚠{_RESET} Model management not available.")
             return True
 
         model_name = parts[1].strip()
@@ -369,159 +443,158 @@ def _handle_slash_command(command: str, ctx: _ReplContext) -> bool:
                 print(f"\r  {status}", end="", flush=True)
 
         try:
-            print(f"Installing {model_name}...")
+            print(f"{_AMBER}⟳{_RESET} Installing {_BOLD}{model_name}{_RESET}...")
             ctx.model_manager.install_model(
                 model_name, progress_callback=_print_progress
             )
-            print(f"\nModel '{model_name}' installed successfully.")
+            print(f"{_GREEN}✓{_RESET} Model '{_AMBER}{model_name}{_RESET}' installed successfully.")
         except ValueError as exc:
-            print(f"Invalid model name: {exc}")
+            print(f"{_RED}✖{_RESET} Invalid model name: {exc}")
         except Exception as exc:
-            print(f"\nInstallation failed: {exc}")
+            print(f"{_RED}✖{_RESET} Installation failed: {exc}")
         return True
 
     # -- /uninstall <model> -------------------------------------------------
     if cmd == "/uninstall":
         if len(parts) < 2 or not parts[1].strip():
-            print("Usage: /uninstall <model>")
+            print(f"{_ORANGE}Usage:{_RESET} /uninstall <model>")
             return True
 
         if ctx.model_manager is None:
-            print("Model management not available.")
+            print(f"{_YELLOW}⚠{_RESET} Model management not available.")
             return True
 
         model_name = parts[1].strip()
         try:
             ctx.model_manager.delete_model(model_name)
-            print(f"Model '{model_name}' deleted.")
+            print(f"{_GREEN}✓{_RESET} Model '{_AMBER}{model_name}{_RESET}' deleted.")
         except ValueError as exc:
-            print(f"Invalid model name: {exc}")
+            print(f"{_RED}✖{_RESET} Invalid model name: {exc}")
         except Exception as exc:
-            print(f"Deletion failed: {exc}")
+            print(f"{_RED}✖{_RESET} Deletion failed: {exc}")
         return True
 
     # -- /info <model> ------------------------------------------------------
     if cmd == "/info":
         if len(parts) < 2 or not parts[1].strip():
-            print("Usage: /info <model>")
+            print(f"{_ORANGE}Usage:{_RESET} /info <model>")
             return True
 
         if ctx.model_manager is None:
-            print("Model management not available.")
+            print(f"{_YELLOW}⚠{_RESET} Model management not available.")
             return True
 
         model_name = parts[1].strip()
         try:
             info = ctx.model_manager.get_model_info(model_name)
-            print(f"\nModel: {model_name}")
+            print(f"\n{_AMBER}{_BOLD}Model:{_RESET} {model_name}")
             details = info.get("details", {})
             if isinstance(details, dict):
                 for key, value in details.items():
-                    print(f"  {key}: {value}")
+                    print(f"  {_GRAY}{key}:{_RESET} {value}")
             capabilities = info.get("capabilities")
             if capabilities:
-                print(f"  capabilities: {', '.join(capabilities)}")
+                print(f"  {_GRAY}capabilities:{_RESET} {_GREEN}{', '.join(capabilities)}{_RESET}")
             license_text = info.get("license")
             if license_text:
-                # Show only the first line of the license.
                 first_line = license_text.strip().split("\n")[0]
-                print(f"  license: {first_line}")
+                print(f"  {_GRAY}license:{_RESET} {first_line}")
             print()
         except ValueError as exc:
-            print(f"Invalid model name: {exc}")
+            print(f"{_RED}✖{_RESET} Invalid model name: {exc}")
         except Exception as exc:
-            print(f"Failed to get model info: {exc}")
+            print(f"{_RED}✖{_RESET} Failed to get model info: {exc}")
         return True
 
     # -- /running -----------------------------------------------------------
     if cmd == "/running":
         if ctx.model_manager is None:
-            print("Model management not available.")
+            print(f"{_YELLOW}⚠{_RESET} Model management not available.")
             return True
 
         try:
             running = ctx.model_manager.list_running()
             if not running:
-                print("No models currently loaded in VRAM.")
+                print(f"{_GRAY}No models currently loaded in VRAM.{_RESET}")
             else:
-                print(f"\nModels loaded in VRAM ({len(running)}):")
+                print(f"\n{_AMBER}{_BOLD}Models in VRAM ({len(running)}):{_RESET}")
                 for model_info in running:
                     name = model_info.get("name", "unknown")
                     size = model_info.get("size", 0)
                     size_gb = size / (1024 ** 3) if size else 0
-                    print(f"  {name} ({size_gb:.1f} GB)")
+                    print(f"  {_GREEN}{name}{_RESET} ({_GRAY}{size_gb:.1f} GB{_RESET})")
                 print()
         except Exception as exc:
-            print(f"Failed to list running models: {exc}")
+            print(f"{_RED}✖{_RESET} Failed to list running models: {exc}")
         return True
 
     # -- /provider [name] ---------------------------------------------------
     if cmd == "/provider":
         if ctx.orchestrator is None:
-            print("Provider management not available.")
+            print(f"{_YELLOW}⚠{_RESET} Provider management not available.")
             return True
 
         if len(parts) < 2 or not parts[1].strip():
-            # Show current provider.
             current = ctx.orchestrator.get_active_provider_name()
-            print(f"Active provider: {current}")
+            prov_color = _GREEN if current == "ollama" else _YELLOW
+            print(f"{prov_color}◆{_RESET} Active provider: {_BOLD}{current}{_RESET}")
             return True
 
         new_provider = parts[1].strip().lower()
         try:
             ctx.orchestrator.switch_provider(new_provider)
-            print(f"Switched to provider: {new_provider}")
+            prov_color = _GREEN if new_provider == "ollama" else _YELLOW
+            print(f"{prov_color}◆{_RESET} Switched to provider: {_BOLD}{new_provider}{_RESET}")
         except ValueError as exc:
-            print(f"Failed to switch provider: {exc}")
+            print(f"{_RED}✖{_RESET} Failed to switch provider: {exc}")
         return True
 
     # -- /brain [model] -----------------------------------------------------
     if cmd == "/brain":
         if ctx.orchestrator is None:
-            print("Orchestrator not available.")
+            print(f"{_YELLOW}⚠{_RESET} Orchestrator not available.")
             return True
 
         if len(parts) < 2 or not parts[1].strip():
-            # Show current brain model.
             brain = ctx.orchestrator.get_brain_model()
-            print(f"Brain model: {brain}")
+            print(f"{_AMBER}🧠{_RESET} Brain model: {_BOLD}{brain}{_RESET}")
             return True
 
         new_brain = parts[1].strip()
         try:
             ctx.orchestrator.set_brain_model(new_brain)
-            print(f"Brain model set to: {new_brain}")
+            print(f"{_GREEN}✓{_RESET} Brain model set to: {_AMBER}{new_brain}{_RESET}")
         except ValueError as exc:
-            print(f"Invalid brain model: {exc}")
+            print(f"{_RED}✖{_RESET} Invalid brain model: {exc}")
         return True
 
     # -- /registry ----------------------------------------------------------
     if cmd == "/registry":
         if ctx.orchestrator is None:
-            print("Orchestrator not available.")
+            print(f"{_YELLOW}⚠{_RESET} Orchestrator not available.")
             return True
 
         registry = ctx.orchestrator.registry
         if registry is None:
-            print("No model registry configured.")
+            print(f"{_YELLOW}⚠{_RESET} No model registry configured.")
             return True
 
         routes = registry.list_routes()
         if not routes:
-            print("Model registry is empty (using defaults).")
+            print(f"{_GRAY}Model registry is empty (using defaults).{_RESET}")
             default_provider, default_model = registry.get_default()
-            print(f"Default: {default_provider}/{default_model}")
+            print(f"  {_GRAY}Default:{_RESET} {default_provider}/{_AMBER}{default_model}{_RESET}")
         else:
-            print(f"\nModel Registry:")
+            print(f"\n{_AMBER}{_BOLD}Model Registry:{_RESET}")
             default_provider, default_model = registry.get_default()
-            print(f"  Default: {default_provider}/{default_model}")
+            print(f"  {_GRAY}Default:{_RESET} {default_provider}/{_AMBER}{default_model}{_RESET}")
             for task_type, entries in routes.items():
-                print(f"  {task_type}:")
+                print(f"  {_YELLOW}{task_type}:{_RESET}")
                 for entry in entries:
                     provider = entry.get("provider", "?")
                     model = entry.get("model", "?")
                     priority = entry.get("priority", "?")
-                    print(f"    [{priority}] {provider}/{model}")
+                    print(f"    [{_GRAY}{priority}{_RESET}] {provider}/{_AMBER}{model}{_RESET}")
             print()
         return True
 
@@ -529,16 +602,19 @@ def _handle_slash_command(command: str, ctx: _ReplContext) -> bool:
     if cmd == "/update":
         from local_cli.updater import check_for_updates, perform_update
 
-        print("Checking for updates...")
+        print(f"{_AMBER}⟳{_RESET} Checking for updates...")
         has_updates, check_msg = check_for_updates()
         if not has_updates:
-            print(check_msg)
+            print(f"{_GREEN}✓{_RESET} {check_msg}")
             return True
 
-        print(check_msg)
-        print("Updating...")
+        print(f"{_YELLOW}ℹ{_RESET} {check_msg}")
+        print(f"{_AMBER}⟳{_RESET} Updating...")
         success, update_msg = perform_update()
-        print(update_msg)
+        if success:
+            print(f"{_GREEN}✓{_RESET} {update_msg}")
+        else:
+            print(f"{_RED}✖{_RESET} {update_msg}")
         return True
 
     # -- /context -----------------------------------------------------------
@@ -548,16 +624,16 @@ def _handle_slash_command(command: str, ctx: _ReplContext) -> bool:
         token_limit = _COMPACT_TOKEN_THRESHOLD
         compaction_triggered = _needs_compaction(ctx.messages)
         compaction_status = "triggered" if compaction_triggered else "not triggered"
+        status_color = _RED if compaction_triggered else _GREEN
         print(
-            f"Messages: {msg_count} | "
-            f"Est. tokens: ~{est_tokens} / {token_limit} | "
-            f"Compaction: {compaction_status}"
+            f"{_GRAY}Messages:{_RESET} {_BOLD}{msg_count}{_RESET} | "
+            f"{_GRAY}Tokens:{_RESET} ~{_BOLD}{est_tokens}{_RESET} / {token_limit} | "
+            f"{_GRAY}Compaction:{_RESET} {status_color}{compaction_status}{_RESET}"
         )
         return True
 
     # -- /copy --------------------------------------------------------------
     if cmd == "/copy":
-        # Find the last assistant message in the conversation history.
         last_assistant = None
         for msg in reversed(ctx.messages):
             if msg.get("role") == "assistant":
@@ -567,22 +643,22 @@ def _handle_slash_command(command: str, ctx: _ReplContext) -> bool:
                     break
 
         if last_assistant is None:
-            print("Nothing to copy.")
+            print(f"{_YELLOW}⚠{_RESET} Nothing to copy.")
             return True
 
         try:
             copy_to_clipboard(last_assistant)
-            print("Copied to clipboard.")
+            print(f"{_GREEN}✓{_RESET} Copied to clipboard.")
         except ClipboardUnavailableError:
-            print("Clipboard not available.")
+            print(f"{_YELLOW}⚠{_RESET} Clipboard not available.")
         except ClipboardError as exc:
-            print(f"Copy failed: {exc}")
+            print(f"{_RED}✖{_RESET} Copy failed: {exc}")
         return True
 
     # -- /usage -------------------------------------------------------------
     if cmd == "/usage":
         if ctx.token_tracker is None:
-            print("Token tracking not available.")
+            print(f"{_YELLOW}⚠{_RESET} Token tracking not available.")
             return True
 
         print(ctx.token_tracker.format_table())
@@ -591,18 +667,19 @@ def _handle_slash_command(command: str, ctx: _ReplContext) -> bool:
     # -- /agents ------------------------------------------------------------
     if cmd == "/agents":
         if ctx.sub_agent_runner is None:
-            print("Sub-agent support not available.")
+            print(f"{_YELLOW}⚠{_RESET} Sub-agent support not available.")
             return True
 
         agents = ctx.sub_agent_runner.list_background_agents()
         if not agents:
-            print("No background agents.")
+            print(f"{_GRAY}No background agents.{_RESET}")
         else:
-            print(f"\nBackground agents ({len(agents)}):")
+            print(f"\n{_AMBER}{_BOLD}Background agents ({len(agents)}):{_RESET}")
             for info in agents:
                 agent_id = info.get("agent_id", "?")
                 status = info.get("status", "?")
-                print(f"  {agent_id}  {status}")
+                status_color = _GREEN if status == "running" else _YELLOW if status == "pending" else _GRAY
+                print(f"  {_CYAN}{agent_id}{_RESET}  {status_color}{status}{_RESET}")
             print()
         return True
 
@@ -618,13 +695,61 @@ def _handle_slash_command(command: str, ctx: _ReplContext) -> bool:
     if cmd == "/knowledge":
         return _handle_knowledge_command(parts, ctx)
 
+    # -- /memory [subcommand] -------------------------------------------------
+    if cmd == "/memory":
+        return _handle_memory_command(parts, ctx)
+
+    # -- /identity ------------------------------------------------------------
+    if cmd == "/identity":
+        return _handle_identity_command(ctx)
+
+    # -- /nudge ---------------------------------------------------------------
+    if cmd == "/nudge":
+        return _handle_nudge_command(ctx)
+
+    # -- /improve [subcommand] ------------------------------------------------
+    if cmd == "/improve":
+        return _handle_improve_command(parts, ctx)
+
+    # -- /queue <command> ------------------------------------------------------
+    if cmd == "/queue":
+        return _handle_queue_command(parts)
+
+    # -- /bg <command> ---------------------------------------------------------
+    if cmd == "/bg":
+        return _handle_bg_command(parts)
+
+    # -- /stop -----------------------------------------------------------------
+    if cmd == "/stop":
+        return _handle_stop_command()
+
+    # -- /interview ------------------------------------------------------------
+    if cmd == "/interview":
+        return _handle_interview_command(parts)
+
     # -- /skills [subcommand] -----------------------------------------------
     if cmd == "/skills":
         return _handle_skills_command(parts, ctx)
 
+    # -- /session [subcommand] -------------------------------------------------
+    if cmd == "/session":
+        return _handle_session_command(parts, ctx)
+
+    # -- /heal ----------------------------------------------------------------
+    if cmd == "/heal":
+        return _handle_heal_command(ctx)
+
+    # -- /structure [depth] ---------------------------------------------------
+    if cmd == "/structure":
+        return _handle_structure_command(parts, ctx)
+
+    # -- /log -----------------------------------------------------------------
+    if cmd == "/log":
+        return _handle_log_command(parts, ctx)
+
     # -- Unknown command ----------------------------------------------------
-    print(f"Unknown command: {stripped}")
-    print("Type /help for a list of commands.")
+    print(f"{_RED}✖ Unknown command:{_RESET} {stripped}")
+    print(f"{_GRAY}Type /help for a list of commands.{_RESET}")
     return True
 
 
@@ -786,8 +911,109 @@ def _handle_plan_command(parts: list[str], ctx: _ReplContext) -> bool:
             print(f"Failed to abandon plan: {exc}")
         return True
 
+    if subcmd == "big":
+        return _plan_big(ctx)
+
     print(f"Unknown plan subcommand: {subcmd}")
-    print("Usage: /plan [list|create|show|activate|update|review|abandon]")
+    print("Usage: /plan [list|create|show|activate|update|review|abandon|big]")
+    return True
+
+
+def _plan_big(ctx: _ReplContext) -> bool:
+    """Show big-picture overview of all plans with progress bars.
+
+    Args:
+        ctx: The REPL context.
+
+    Returns:
+        True to continue the REPL.
+    """
+    try:
+        plans = ctx.plan_manager.list_plans()
+    except PlanError as exc:
+        print(f"Failed to list plans: {exc}")
+        return True
+
+    if not plans:
+        print(f"{_YELLOW}No plans found. Create one with /plan create <title>{_RESET}")
+        return True
+
+    print(f"\n{_RED}{_BOLD}╔══════════════════════════════════════════════════════╗{_RESET}")
+    print(f"{_RED}{_BOLD}║              PLANS BIG PICTURE                     ║{_RESET}")
+    print(f"{_RED}{_BOLD}╚══════════════════════════════════════════════════════╝{_RESET}")
+
+    total_steps = 0
+    total_done = 0
+    active_count = 0
+    complete_count = 0
+
+    for plan in plans:
+        done = sum(1 for d, _ in plan.steps if d)
+        total = len(plan.steps)
+        total_steps += total
+        total_done += done
+        if plan.status == "active":
+            active_count += 1
+        elif plan.status == "complete":
+            complete_count += 1
+
+        # Build progress bar.
+        bar_width = 30
+        if total > 0:
+            pct = done / total
+            filled = int(bar_width * pct)
+            bar = "█" * filled + "░" * (bar_width - filled)
+        else:
+            bar = "░" * bar_width
+
+        active_marker = f"{_GREEN}▶{_RESET}" if plan.plan_id == ctx.active_plan_id else " "
+
+        # Color the plan ID based on status.
+        if plan.status == "complete":
+            id_color = _GREEN
+        elif plan.status == "active":
+            id_color = _AMBER
+        elif plan.status == "abandoned":
+            id_color = _GRAY
+        else:
+            id_color = _YELLOW
+
+        progress = f"{done}/{total}" if total > 0 else "-"
+        print(
+            f"\n {active_marker} {id_color}{plan.plan_id}{_RESET}  "
+            f"{plan.title:<30} "
+            f"{_BOLD}{bar}{_RESET}  "
+            f"{progress:<5} "
+            f"{_GRAY}({plan.status}){_RESET}"
+        )
+
+        # Show created date.
+        if plan.created:
+            print(f"     {_GRAY}created: {plan.created[:10]}{_RESET}")
+
+        # Show a snippet of steps inline.
+        for i, (done_flag, text) in enumerate(plan.steps[:3], 1):
+            checkbox = f"{_GREEN}✓{_RESET}" if done_flag else f"{_GRAY}○{_RESET}"
+            max_text = 60
+            display = text[:max_text] + "..." if len(text) > max_text else text
+            print(f"     {checkbox} {display}")
+        if len(plan.steps) > 3:
+            print(f"     {_GRAY}... and {len(plan.steps) - 3} more step(s){_RESET}")
+
+    # ── Summary footer ───────────────────────────────────────────────
+    print(f"\n{_RED}─{_RESET}{_BOLD}{'─' * 55}{_RESET}")
+    total_pct = (total_done / total_steps * 100) if total_steps > 0 else 0
+    bar_width = 30
+    filled = int(bar_width * total_pct / 100) if total_steps > 0 else 0
+    summary_bar = "█" * filled + "░" * (bar_width - filled)
+    print(
+        f" {_BOLD}Total:{_RESET} {len(plans)} plan(s), "
+        f"{active_count} active, {complete_count} complete | "
+        f"{total_done}/{total_steps} steps  "
+        f"{summary_bar}  {total_pct:.0f}%"
+    )
+    print(f"{_GRAY}▶ = active plan (context auto-injected){_RESET}")
+    print()
     return True
 
 
@@ -1049,6 +1275,203 @@ def _knowledge_list(ctx: _ReplContext) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Memory command handler
+# ---------------------------------------------------------------------------
+
+
+def _handle_memory_command(parts: list[str], ctx: _ReplContext) -> bool:
+    """Handle /memory slash command and its subcommands.
+
+    Subcommands:
+        - ``/memory`` or ``/memory list`` — list pending proposals.
+        - ``/memory propose <content>`` — create a new pending proposal.
+        - ``/memory approve [id]`` — approve a pending proposal.
+        - ``/memory reject [id]`` — reject a pending proposal.
+        - ``/memory show`` — display current MEMORY.md content.
+        - ``/memory edit`` — open MEMORY.md in ``$EDITOR``.
+        - ``/memory clear`` — clear all proposals.
+
+    Args:
+        parts: The split command parts (``["/memory", ...]``).
+        ctx: The REPL context containing shared state.
+
+    Returns:
+        True to continue the REPL.
+    """
+    if ctx.memory_proposal_manager is None:
+        print("Memory proposal system not available.")
+        return True
+
+    mgr = ctx.memory_proposal_manager
+
+    # No subcommand or "list" → list pending proposals.
+    if len(parts) < 2 or not parts[1].strip():
+        return _memory_list(ctx, mgr)
+
+    sub_parts = parts[1].strip().split(maxsplit=1)
+    subcmd = sub_parts[0].lower()
+    sub_arg = sub_parts[1].strip() if len(sub_parts) > 1 else ""
+
+    if subcmd == "list":
+        return _memory_list(ctx, mgr)
+
+    if subcmd == "propose":
+        if not sub_arg:
+            print("Usage: /memory propose <content>")
+            return True
+        try:
+            proposal = mgr.propose(sub_arg)
+            print(
+                f"Memory proposal {proposal['id']} created. "
+                f"Run `/memory approve {proposal['id']}` to add it to MEMORY.md."
+            )
+        except MemoryError as exc:
+            print(f"Failed to create proposal: {exc}")
+        return True
+
+    if subcmd == "approve":
+        if not sub_arg:
+            pending = mgr.list_pending()
+            if not pending:
+                print("No pending proposals to approve.")
+                return True
+            if len(pending) > 1:
+                print("Multiple pending proposals. Specify an ID: /memory approve <id>")
+                return _memory_list(ctx, mgr)
+            sub_arg = pending[0]["id"]
+        try:
+            proposal = mgr.approve(sub_arg)
+            print(
+                f"Proposal {proposal['id']} approved and appended to MEMORY.md."
+            )
+            # Show size warning if MEMORY.md is getting large.
+            if mgr.is_memory_too_large():
+                print(
+                    "  Note: MEMORY.md is over 256 KB. "
+                    "Consider summarizing or archiving old entries."
+                )
+        except MemoryProposalNotFoundError:
+            print(f"Proposal '{sub_arg}' not found.")
+        except MemoryError as exc:
+            print(f"Failed to approve proposal: {exc}")
+        return True
+
+    if subcmd == "reject":
+        if not sub_arg:
+            pending = mgr.list_pending()
+            if not pending:
+                print("No pending proposals to reject.")
+                return True
+            if len(pending) > 1:
+                print("Multiple pending proposals. Specify an ID: /memory reject <id>")
+                return _memory_list(ctx, mgr)
+            sub_arg = pending[0]["id"]
+        try:
+            proposal = mgr.reject(sub_arg)
+            print(f"Proposal '{proposal['id']}' rejected.")
+        except MemoryProposalNotFoundError:
+            print(f"Proposal '{sub_arg}' not found.")
+        except MemoryError as exc:
+            print(f"Failed to reject proposal: {exc}")
+        return True
+
+    if subcmd == "show":
+        content = mgr.show_memory()
+        if not content:
+            print("MEMORY.md does not exist yet. Create a proposal with /memory propose first.")
+            return True
+        size = mgr.get_memory_size()
+        print(f"\n--- MEMORY.md ({size} bytes) ---")
+        print(content)
+        if not content.endswith("\n"):
+            print()
+        if mgr.is_memory_too_large():
+            print("  (MEMORY.md is over 256 KB — consider summarizing)")
+        return True
+
+    if subcmd == "edit":
+        try:
+            result = mgr.edit_memory()
+            print(result)
+        except MemoryError as exc:
+            print(f"Failed to edit MEMORY.md: {exc}")
+        return True
+
+    if subcmd == "clear":
+        count = mgr.clear_all()
+        if count > 0:
+            print(f"Cleared {count} proposal(s).")
+        else:
+            print("No proposals to clear.")
+        return True
+
+    print(f"Unknown memory subcommand: {subcmd}")
+    print("Usage: /memory [list|propose|approve|reject|show|edit|clear]")
+    return True
+
+
+def _memory_list(ctx: _ReplContext, mgr: MemoryProposalManager) -> bool:
+    """List pending memory proposals.
+
+    Args:
+        ctx: The REPL context.
+        mgr: The MemoryProposalManager instance.
+
+    Returns:
+        True to continue the REPL.
+    """
+    pending = mgr.list_pending()
+    if not pending:
+        print("No pending memory proposals.")
+        return True
+
+    print(f"\nPending memory proposals ({len(pending)}):")
+    for p in pending:
+        pid = p.get("id", "?")
+        content = p.get("content", "")
+        timestamp = p.get("timestamp", "")
+        preview = content[:80].replace("\n", " ")
+        if len(content) > 80:
+            preview += "..."
+        print(f"  {pid}  [{timestamp}]  {preview}")
+    print()
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Identity command handler
+# ---------------------------------------------------------------------------
+
+
+def _handle_identity_command(ctx: _ReplContext) -> bool:
+    """Handle /identity command — show loaded identity file status.
+
+    Args:
+        ctx: The REPL context.
+
+    Returns:
+        True to continue the REPL.
+    """
+    if ctx.identity_loader is None:
+        print("Identity system not available.")
+        return True
+
+    status = ctx.identity_loader.get_status()
+    if not any(status.values()):
+        print("\nIdentity files: none found.")
+        print("Create .agents/SOUL.md, .agents/USER.md, etc. to get started,")
+        print("or run `local-cli --init-agents` to generate default templates.\n")
+        return True
+
+    print("\nIdentity files:")
+    for name, exists in status.items():
+        marker = "✓" if exists else " "
+        print(f"  [{marker}] {name}")
+    print()
+    return True
+
+
+# ---------------------------------------------------------------------------
 # Skills command handler
 # ---------------------------------------------------------------------------
 
@@ -1059,6 +1482,12 @@ def _handle_skills_command(parts: list[str], ctx: _ReplContext) -> bool:
     Subcommands:
         - ``/skills`` or ``/skills list`` — list all discovered skills.
         - ``/skills show <name>`` — show a skill's content.
+        - ``/skills propose <content>`` — create a new pending skill proposal.
+        - ``/skills approve [id]`` — approve and create skill from proposal.
+        - ``/skills reject [id]`` — reject a pending skill proposal.
+        - ``/skills review [id]`` — show full details of a proposal.
+        - ``/skills list-proposals`` — list all pending proposals.
+        - ``/skills delete <name>`` — delete an existing skill.
 
     Args:
         parts: The split command parts (``["/skills", ...]``).
@@ -1093,8 +1522,111 @@ def _handle_skills_command(parts: list[str], ctx: _ReplContext) -> bool:
             print(f"Skill '{sub_arg}' not found.")
         return True
 
+    if subcmd == "propose":
+        if not sub_arg:
+            print("Usage: /skills propose <content>")
+            return True
+        if ctx.skill_proposal_manager is None:
+            print("Skill proposal system not available.")
+            return True
+        try:
+            proposal = ctx.skill_proposal_manager.propose(content=sub_arg)
+            print(
+                f"Skill proposal {proposal['id']} created. "
+                f"Run `/skills approve {proposal['id']}` to create the skill file."
+            )
+        except SkillProposalError as exc:
+            print(f"Failed to create proposal: {exc}")
+        return True
+
+    if subcmd == "approve":
+        if ctx.skill_proposal_manager is None:
+            print("Skill proposal system not available.")
+            return True
+        if not sub_arg:
+            pending = ctx.skill_proposal_manager.list_pending()
+            if not pending:
+                print("No pending skill proposals to approve.")
+                return True
+            if len(pending) > 1:
+                print("Multiple pending proposals. Specify an ID: /skills approve <id>")
+                return _skill_proposals_list(ctx)
+            sub_arg = pending[0]["id"]
+        try:
+            proposal = ctx.skill_proposal_manager.approve(sub_arg)
+            print(
+                f"Proposal {proposal['id']} ('{proposal['name']}') approved. "
+                f"Skill file created at .agents/skills/{proposal['name']}/SKILL.md."
+            )
+            # Skills loader is refreshed via the post-approve callback.
+        except SkillProposalNotFoundError:
+            print(f"Proposal '{sub_arg}' not found.")
+        except SkillProposalInvalidStatusError as exc:
+            print(str(exc))
+        except SkillProposalError as exc:
+            print(f"Failed to approve proposal: {exc}")
+        return True
+
+    if subcmd == "reject":
+        if ctx.skill_proposal_manager is None:
+            print("Skill proposal system not available.")
+            return True
+        if not sub_arg:
+            pending = ctx.skill_proposal_manager.list_pending()
+            if not pending:
+                print("No pending skill proposals to reject.")
+                return True
+            if len(pending) > 1:
+                print("Multiple pending proposals. Specify an ID: /skills reject <id>")
+                return _skill_proposals_list(ctx)
+            sub_arg = pending[0]["id"]
+        try:
+            proposal = ctx.skill_proposal_manager.reject(sub_arg)
+            print(f"Proposal '{proposal['id']}' ('{proposal['name']}') rejected.")
+        except SkillProposalNotFoundError:
+            print(f"Proposal '{sub_arg}' not found.")
+        except SkillProposalInvalidStatusError as exc:
+            print(str(exc))
+        return True
+
+    if subcmd == "review":
+        if ctx.skill_proposal_manager is None:
+            print("Skill proposal system not available.")
+            return True
+        if not sub_arg:
+            print("Usage: /skills review <id>")
+            return True
+        try:
+            proposal = ctx.skill_proposal_manager.get_proposal(sub_arg)
+            _print_skill_proposal(proposal)
+        except SkillProposalNotFoundError:
+            print(f"Proposal '{sub_arg}' not found.")
+        return True
+
+    if subcmd in ("list-proposals", "list_proposals"):
+        if ctx.skill_proposal_manager is None:
+            print("Skill proposal system not available.")
+            return True
+        return _skill_proposals_list(ctx)
+
+    if subcmd == "delete":
+        if ctx.skill_proposal_manager is None:
+            print("Skill proposal system not available.")
+            return True
+        if not sub_arg:
+            print("Usage: /skills delete <name>")
+            return True
+        try:
+            result = ctx.skill_proposal_manager.delete_skill(sub_arg)
+            print(result)
+            # Refresh skills loader.
+            ctx.skills_loader.discover_skills()
+        except SkillFileError as exc:
+            print(str(exc))
+        return True
+
     print(f"Unknown skills subcommand: {subcmd}")
-    print("Usage: /skills [list|show <name>]")
+    print("Usage: /skills [list|show|propose|approve|reject|review|list-proposals|delete]")
     return True
 
 
@@ -1110,6 +1642,11 @@ def _skills_list(ctx: _ReplContext) -> bool:
     skills = ctx.skills_loader.list_skills()
     if not skills:
         print("No skills discovered.")
+        # Also show any pending proposals if available.
+        if ctx.skill_proposal_manager is not None:
+            pending = ctx.skill_proposal_manager.list_pending()
+            if pending:
+                print(f"  ({len(pending)} pending proposal(s) — use /skills list-proposals to view)")
         return True
 
     print("\nSkills:")
@@ -1119,7 +1656,381 @@ def _skills_list(ctx: _ReplContext) -> bool:
         if triggers:
             print(f"    triggers: {triggers}")
     print()
+
+    # Show pending proposal count if any.
+    if ctx.skill_proposal_manager is not None:
+        pending = ctx.skill_proposal_manager.list_pending()
+        if pending:
+            print(f"  ({len(pending)} pending proposal(s) — use /skills list-proposals to view)")
+
     return True
+
+
+def _skill_proposals_list(ctx: _ReplContext) -> bool:
+    """List pending skill proposals.
+
+    Args:
+        ctx: The REPL context.
+
+    Returns:
+        True to continue the REPL.
+    """
+    mgr = ctx.skill_proposal_manager
+    if mgr is None:
+        print("Skill proposal system not available.")
+        return True
+
+    pending = mgr.list_pending()
+    if not pending:
+        print("No pending skill proposals.")
+        return True
+
+    print(f"\nPending skill proposals ({len(pending)}):")
+    for p in pending:
+        pid = p.get("id", "?")
+        name = p.get("name", "?")
+        desc = p.get("description", "")
+        timestamp = p.get("timestamp", "")
+        preview = desc[:60] if desc else f"({name})"
+        if len(preview) > 60:
+            preview += "..."
+        print(f"  {pid}  [{timestamp}]  {preview}")
+    print()
+    return True
+
+
+def _print_skill_proposal(proposal: dict) -> None:
+    """Pretty-print a single skill proposal.
+
+    Args:
+        proposal: The proposal dict to display.
+    """
+
+
+# ---------------------------------------------------------------------------
+# Session command handler
+# ---------------------------------------------------------------------------
+
+
+def _handle_session_command(parts: list[str], ctx: _ReplContext) -> bool:
+    """Handle /session command — show or clear session memory contents.
+
+    Usage:
+        ``/session`` — show session memory info and tool history.
+        ``/session clear`` — clear all stored session memory data.
+
+    Args:
+        parts: The split command parts (``["/session", ...]``).
+        ctx: The REPL context containing shared state.
+
+    Returns:
+        True to continue the REPL.
+    """
+    mem = ctx.session_memory
+    if mem is None:
+        print(f"{_YELLOW}⚠{_RESET} Session memory not available.")
+        return True
+
+    # Check for subcommand
+    if len(parts) > 1 and parts[1].strip():
+        subcmd = parts[1].strip().lower()
+        if subcmd == "clear":
+            mem.clear()
+            print(f"{_GREEN}✓{_RESET} Session memory cleared.")
+            return True
+        print(f"{_ORANGE}Usage:{_RESET} /session [clear]")
+        return True
+
+    # ── Display session memory info ────────────────────────────────────
+    print(f"\n{_RED}{_BOLD}╔═══════════════════════════════════════╗{_RESET}")
+    print(f"{_RED}{_BOLD}║       SESSION MEMORY                 ║{_RESET}")
+    print(f"{_RED}{_BOLD}╚═══════════════════════════════════════╝{_RESET}")
+
+    # Temp dir path.
+    print(f"  {_AMBER}📁{_RESET} {_BOLD}Temp dir:{_RESET}  {mem.tmp_dir}")
+
+    # Check if closed (should not happen during normal use).
+    if mem._closed:
+        print(f"  {_RED}✖{_RESET} Session memory is closed (will not persist).")
+        return True
+
+    # Show all stored keys.
+    all_keys = mem.keys()
+    if not all_keys:
+        print(f"  {_GRAY}No data stored in session memory.{_RESET}")
+        return True
+
+    print(f"  {_GRAY}Keys:{_RESET}       {', '.join(all_keys)}")
+
+    # ── Tool history details ───────────────────────────────────────────
+    tool_history = mem.load("tool_history", [])
+    if not tool_history:
+        print(f"\n  {_YELLOW}⊘{_RESET} {_BOLD}Tool history:{_RESET} empty")
+    else:
+        print(f"\n  {_GREEN}⊘{_RESET} {_BOLD}Tool history:{_RESET} {len(tool_history)} entries")
+        # Show the first few and last few entries.
+        max_head = 8
+        max_tail = 4
+        total = len(tool_history)
+
+        if total <= max_head + max_tail:
+            # Show all entries.
+            for idx, entry in enumerate(tool_history):
+                tool_name = entry.get("tool_name", "?")
+                preview = entry.get("result_preview", "")
+                display = preview[:80]
+                if len(preview) > 80:
+                    display += "..."
+                print(f"  {_GRAY}  {idx+1}.{_RESET} [{tool_name}] {display}")
+        else:
+            # Show first max_head, separator, last max_tail.
+            for idx in range(max_head):
+                entry = tool_history[idx]
+                tool_name = entry.get("tool_name", "?")
+                preview = entry.get("result_preview", "")
+                display = preview[:80]
+                if len(preview) > 80:
+                    display += "..."
+                print(f"  {_GRAY}  {idx+1}.{_RESET} [{tool_name}] {display}")
+
+            hidden = total - max_head - max_tail
+            print(f"  {_GRAY}     ... ({hidden} more entries){_RESET}")
+
+            for idx in range(total - max_tail, total):
+                entry = tool_history[idx]
+                tool_name = entry.get("tool_name", "?")
+                preview = entry.get("result_preview", "")
+                display = preview[:80]
+                if len(preview) > 80:
+                    display += "..."
+                print(f"  {_GRAY}  {idx+1}.{_RESET} [{tool_name}] {display}")
+
+    # ── Footer with clear hint ─────────────────────────────────────────
+    print(f"\n  {_GRAY}Use /session clear to reset stored memory.{_RESET}")
+    print()
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Nudge command handler
+# ---------------------------------------------------------------------------
+
+
+def _handle_nudge_command(ctx: _ReplContext) -> bool:
+    """Handle /nudge command — show current nudges.
+
+    Args:
+        ctx: The REPL context.
+
+    Returns:
+        True to continue the REPL.
+    """
+    if ctx.nudge_engine is None:
+        print("Nudge system not available.")
+        return True
+
+    nudges = ctx.nudge_engine.get_nudges()
+    if not nudges:
+        print("No pending nudges — everything looks good!")
+        return True
+
+    print("\n--- Nudges ---")
+    for nudge in nudges:
+        print(f"  - {nudge}")
+    print()
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Improve command handler
+# ---------------------------------------------------------------------------
+
+
+def _handle_improve_command(parts: list[str], ctx: _ReplContext) -> bool:
+    """Handle /improve slash command and its subcommands.
+
+    Subcommands:
+        - ``/improve`` or ``/improve list`` — list pending proposals.
+        - ``/improve propose <target> <content>`` — create a new proposal.
+        - ``/improve approve [id]`` — approve and apply a proposal.
+        - ``/improve reject [id]`` — reject a proposal.
+        - ``/improve review [id]`` — show full details of a proposal.
+
+    Args:
+        parts: The split command parts (``["/improve", ...]``).
+        ctx: The REPL context containing shared state.
+
+    Returns:
+        True to continue the REPL.
+    """
+    if ctx.improvement_proposal_manager is None:
+        print("Improvement proposal system not available.")
+        return True
+
+    mgr = ctx.improvement_proposal_manager
+
+    if len(parts) < 2 or not parts[1].strip():
+        return _improve_list(ctx, mgr)
+
+    sub_parts = parts[1].strip().split(maxsplit=1)
+    subcmd = sub_parts[0].lower()
+    sub_arg = sub_parts[1].strip() if len(sub_parts) > 1 else ""
+
+    if subcmd == "list":
+        return _improve_list(ctx, mgr)
+
+    if subcmd == "propose":
+        if not sub_arg:
+            print("Usage: /improve propose <target> <content>")
+            print(f"  Targets: SOUL.md, GENERAL.md, USER.md, MEMORY.md")
+            return True
+        # Parse target and content from sub_arg.
+        propose_parts = sub_arg.split(maxsplit=1)
+        if len(propose_parts) < 2:
+            print("Usage: /improve propose <target> <content>")
+            return True
+        raw_target = propose_parts[0].strip()
+        # Normalize: uppercase name + lowercase .md extension.
+        if "." in raw_target:
+            name_part = raw_target.rsplit(".", 1)[0].upper()
+        else:
+            name_part = raw_target.upper()
+        target = name_part + ".md"
+        content = propose_parts[1]
+        try:
+            proposal = mgr.propose(content=content, target=target)
+            print(
+                f"Improvement proposal {proposal['id']} created for {proposal['target']}. "
+                f"Run `/improve approve {proposal['id']}` to apply it."
+            )
+        except InvalidTargetError as exc:
+            print(str(exc))
+        except ImprovementError as exc:
+            print(f"Failed to create proposal: {exc}")
+        return True
+
+    if subcmd == "approve":
+        if not sub_arg:
+            pending = mgr.list_pending()
+            if not pending:
+                print("No pending improvement proposals to approve.")
+                return True
+            if len(pending) > 1:
+                print("Multiple pending proposals. Specify an ID: /improve approve <id>")
+                return _improve_list(ctx, mgr)
+            sub_arg = pending[0]["id"]
+        try:
+            proposal = mgr.approve(sub_arg)
+            print(
+                f"Proposal {proposal['id']} approved and applied to {proposal['target']}."
+            )
+        except ImprovementProposalNotFoundError:
+            print(f"Proposal '{sub_arg}' not found.")
+        except ImprovementProposalInvalidStatusError as exc:
+            print(str(exc))
+        except ImprovementError as exc:
+            print(f"Failed to approve: {exc}")
+        return True
+
+    if subcmd == "reject":
+        if not sub_arg:
+            pending = mgr.list_pending()
+            if not pending:
+                print("No pending improvement proposals to reject.")
+                return True
+            if len(pending) > 1:
+                print("Multiple pending proposals. Specify an ID: /improve reject <id>")
+                return _improve_list(ctx, mgr)
+            sub_arg = pending[0]["id"]
+        try:
+            proposal = mgr.reject(sub_arg)
+            print(f"Proposal {proposal['id']} rejected.")
+        except ImprovementProposalNotFoundError:
+            print(f"Proposal '{sub_arg}' not found.")
+        except ImprovementProposalInvalidStatusError as exc:
+            print(str(exc))
+        return True
+
+    if subcmd == "review":
+        if not sub_arg:
+            print("Usage: /improve review <id>")
+            return True
+        try:
+            proposal = mgr.get_proposal(sub_arg)
+            _print_improve_proposal(proposal)
+        except ImprovementProposalNotFoundError:
+            print(f"Proposal '{sub_arg}' not found.")
+        return True
+
+    print(f"Unknown improve subcommand: {subcmd}")
+    print("Usage: /improve [list|propose|approve|reject|review]")
+    return True
+
+
+def _improve_list(ctx: _ReplContext, mgr: ImprovementProposalManager) -> bool:
+    """List pending improvement proposals.
+
+    Args:
+        ctx: The REPL context.
+        mgr: The ImprovementProposalManager instance.
+
+    Returns:
+        True to continue the REPL.
+    """
+    pending = mgr.list_pending()
+    if not pending:
+        print("No pending improvement proposals.")
+        return True
+
+    print(f"\nPending improvement proposals ({len(pending)}):")
+    for p in pending:
+        pid = p.get("id", "?")
+        target = p.get("target", "?")
+        desc = p.get("description", "")
+        timestamp = p.get("timestamp", "")
+        preview = desc[:60]
+        if len(desc) > 60:
+            preview += "..."
+        print(f"  {pid}  [{target}]  [{timestamp}]  {preview}")
+    print()
+    return True
+
+
+def _print_improve_proposal(proposal: dict) -> None:
+    """Pretty-print a single improvement proposal.
+
+    Args:
+        proposal: The proposal dict to display.
+    """
+    print(f"\n--- Improvement Proposal: {proposal.get('id', '?')} ---")
+    print(f"Target:      {proposal.get('target', '?')}")
+    print(f"Status:      {proposal.get('status', '?')}")
+    print(f"Proposed by: {proposal.get('proposed_by', '?')}")
+    print(f"Timestamp:   {proposal.get('timestamp', '?')}")
+    desc = proposal.get('description', '')
+    if desc:
+        print(f"Description: {desc}")
+    print(f"\nContent:\n{proposal.get('content', '')}")
+    print()
+
+
+# ---------------------------------------------------------------------------
+# Argument parser
+# ---------------------------------------------------------------------------
+
+    print(f"\n--- Skill Proposal: {proposal.get('id', '?')} ---")
+    print(f"Name:        {proposal.get('name', '?')}")
+    print(f"Status:      {proposal.get('status', '?')}")
+    print(f"Proposed by: {proposal.get('proposed_by', '?')}")
+    print(f"Timestamp:   {proposal.get('timestamp', '?')}")
+    desc = proposal.get('description', '')
+    if desc:
+        print(f"Description: {desc}")
+    triggers = proposal.get('triggers', [])
+    if triggers:
+        print(f"Triggers:    {', '.join(triggers)}")
+    print(f"\nContent:\n{proposal.get('content', '')}")
+    print()
 
 
 # ---------------------------------------------------------------------------
@@ -1147,7 +2058,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--model",
         type=str,
         default=None,
-        help="Ollama model to use (default: qwen3.5:9b-q4_K_M).",
+        help="Ollama model to use (default: qwen3.5:9b).",
     )
     parser.add_argument(
         "--debug",
@@ -1276,6 +2187,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Start directly in ideation (brainstorming) mode.",
     )
     parser.add_argument(
+        "--init-agents",
+        action="store_true",
+        default=False,
+        help="Create the .agents/ directory with default template files (SOUL.md, USER.md, etc.) and exit.",
+    )
+    parser.add_argument(
         "--yes",
         "-y",
         dest="auto_approve",
@@ -1291,10 +2208,99 @@ def build_parser() -> argparse.ArgumentParser:
 # ---------------------------------------------------------------------------
 
 
+_AGENT_NAME = "Buffy"
+
+
+def _show_agent_status_box(ctx: _ReplContext) -> None:
+    """Display agent status info (model, ollama, provider, identity) in a colored box.
+
+    Shows the same identity/status information as the welcome banner,
+    formatted with a boxed layout and ANSI colors.
+
+    Args:
+        ctx: The REPL context.
+    """
+    tool_names = ", ".join(t.name for t in ctx.tools)
+
+    # ── Box header ────────────────────────────────────────────────────
+    print(f"  {_RED}{_BOLD}╔══════════════════════════════════════════════╗{_RESET}")
+    print(f"  {_RED}{_BOLD}║              AGENT STATUS                    ║{_RESET}")
+    print(f"  {_RED}{_BOLD}╚══════════════════════════════════════════════╝{_RESET}")
+
+    # ── Model ─────────────────────────────────────────────────────────
+    print(f"  {_AMBER}⚡{_RESET} {_BOLD}Model:{_RESET}     {ctx.config.model}")
+
+    # ── Ollama status ─────────────────────────────────────────────────
+    try:
+        version_info = ctx.client.get_version()
+        version = version_info.get("version", "unknown")
+        print(f"  {_GREEN}●{_RESET} {_BOLD}Ollama:{_RESET}     connected (v{version})")
+    except OllamaConnectionError:
+        print(f"  {_RED}●{_RESET} {_BOLD}Ollama:{_RESET}     {_RED}DISCONNECTED{_RESET}")
+
+    # ── Provider ──────────────────────────────────────────────────────
+    if ctx.orchestrator is not None:
+        prov = ctx.orchestrator.get_active_provider_name()
+        prov_color = _GREEN if prov == "ollama" else _YELLOW
+        print(f"  {prov_color}◆{_RESET} {_BOLD}Provider:{_RESET}   {prov}")
+
+    # ── Tools ─────────────────────────────────────────────────────────
+    print(f"  {_ORANGE}⊘{_RESET} {_BOLD}Tools:{_RESET}      {tool_names}")
+
+    # ── Identity ──────────────────────────────────────────────────────
+    if ctx.identity_loader is not None:
+        identity_status = ctx.identity_loader.get_status()
+        loaded = [name for name, exists in identity_status.items() if exists]
+        if loaded:
+            print(f"  {_YELLOW}◆{_RESET} {_BOLD}Identity:{_RESET}   {', '.join(loaded)}")
+
+    # ── Mode ──────────────────────────────────────────────────────────
+    mode_color = _CYAN if ctx.current_mode == "agent" else _ORANGE
+    print(f"  {mode_color}⎔{_RESET} {_BOLD}Mode:{_RESET}      {ctx.current_mode}")
+
+    # ── Active plan ───────────────────────────────────────────────────
+    if ctx.active_plan_id is not None:
+        print(f"  {_ORANGE}⊘{_RESET} {_BOLD}Plan:{_RESET}      {ctx.active_plan_id}")
+
+    # ── RAG ───────────────────────────────────────────────────────────
+    if ctx.rag_engine is not None:
+        print(f"  {_GREEN}◆{_RESET} {_BOLD}RAG:{_RESET}       enabled")
+
+    # ── Bottom separator ─────────────────────────────────────────────
+    print(f"  {_GRAY}{'═' * 42}{_RESET}")
+
+
+def _show_agent_ready(ctx: _ReplContext) -> None:
+    """Display the agent name with a ready/status indicator.
+
+    Prints the agent name in bold with a green connection dot and
+    a small contextual status line above the ``You>`` prompt.
+
+    Args:
+        ctx: The REPL context.
+    """
+    # Get message count
+    msg_count = sum(1 for m in ctx.messages if m.get("role") == "user")
+    mode_label = "IDEATE" if ctx.current_mode == "ideate" else "AGENT"
+    mode_color = _CYAN if ctx.current_mode == "agent" else _ORANGE
+
+    print(
+        f"  {_AMBER}{_BOLD}{_AGENT_NAME}{_RESET}  "
+        f"{_GREEN}●{_RESET} {_GRAY}Ready{_RESET}  "
+        f"{mode_color}◈{_RESET} {mode_label}  "
+        f"{_GRAY}💬 {msg_count}{_RESET}"
+    )
+
+
 def run_repl(
     config: Config,
     client: OllamaClient,
     tools: list[Tool],
+    identity_loader: IdentityLoader | None = None,
+    memory_proposal_manager: MemoryProposalManager | None = None,
+    skill_proposal_manager: SkillProposalManager | None = None,
+    improvement_proposal_manager: ImprovementProposalManager | None = None,
+    nudge_engine: NudgeEngine | None = None,
     rag_engine: object | None = None,
     rag_topk: int = 5,
     orchestrator: object | None = None,
@@ -1320,6 +2326,10 @@ def run_repl(
         config: Application configuration.
         client: An :class:`OllamaClient` instance.
         tools: A list of :class:`Tool` instances available to the agent.
+        identity_loader: Optional :class:`IdentityLoader` for identity
+            file loading and injection (SOUL.md, USER.md, etc.).
+        memory_proposal_manager: Optional :class:`MemoryProposalManager`
+            for memory proposal management.
         rag_engine: Optional :class:`RAGEngine` for context augmentation.
         rag_topk: Number of RAG results per query.
         orchestrator: Optional :class:`Orchestrator` for provider/brain
@@ -1337,18 +2347,80 @@ def run_repl(
             brainstorming mode.
         initial_mode: Starting REPL mode (``"agent"`` or ``"ideate"``).
     """
-    # Print welcome banner.
+    # Print welcome banner with colors.
     tool_names = ", ".join(t.name for t in tools)
-    print(f"local-cli v{__version__} | model: {config.model}")
-    print(f"Tools: {tool_names}")
-    if rag_engine is not None:
-        print("RAG: enabled")
-    if orchestrator is not None:
-        print(f"Provider: {orchestrator.get_active_provider_name()}")
-    print("Type /help for commands, /exit to quit.\n")
 
-    # Build system prompt with tool descriptions.
-    system_prompt = build_system_prompt(tools)
+    # ── Banner header ────────────────────────────────────────────────
+    print(f"{_RED}{_BOLD}╔══════════════════════════════════════════════╗{_RESET}")
+    print(f"{_RED}{_BOLD}║        local-cli v{__version__:<20}║{_RESET}")
+    print(f"{_RED}{_BOLD}╚══════════════════════════════════════════════╝{_RESET}")
+
+    # ── Model ────────────────────────────────────────────────────────
+    print(f"{_AMBER}⚡{_RESET} {_BOLD}Model:{_RESET}   {config.model}")
+
+    # ── Ollama status ────────────────────────────────────────────────
+    try:
+        version_info = client.get_version()
+        version = version_info.get("version", "unknown")
+        print(f"{_GREEN}●{_RESET} {_BOLD}Ollama:{_RESET}   connected (v{version})")
+    except OllamaConnectionError:
+        print(f"{_RED}●{_RESET} {_BOLD}Ollama:{_RESET}   {_RED}DISCONNECTED{_RESET} — is ollama running?")
+
+    # ── Provider ─────────────────────────────────────────────────────
+    if orchestrator is not None:
+        prov = orchestrator.get_active_provider_name()
+        prov_color = _GREEN if prov == "ollama" else _YELLOW
+        print(f"{prov_color}◆{_RESET} {_BOLD}Provider:{_RESET} {prov}")
+
+    # ── Tools ────────────────────────────────────────────────────────
+    print(f"{_ORANGE}⊘{_RESET} {_BOLD}Tools:{_RESET}    {tool_names}")
+
+    # ── Identity ─────────────────────────────────────────────────────
+    if identity_loader is not None:
+        identity_status = identity_loader.get_status()
+        loaded = [name for name, exists in identity_status.items() if exists]
+        if loaded:
+            print(f"{_YELLOW}◆{_RESET} {_BOLD}Identity:{_RESET} {', '.join(loaded)}")
+        else:
+            print(f"{_GRAY}◇{_RESET} Identity: none (run /identity for details){_RESET}")
+
+    # ── RAG ──────────────────────────────────────────────────────────
+    if rag_engine is not None:
+        print(f"{_GREEN}◆{_RESET} {_BOLD}RAG:{_RESET}     enabled")
+
+    # ── Mode ─────────────────────────────────────────────────────────
+    print(f"{_ORANGE}⎔{_RESET} {_BOLD}Mode:{_RESET}    {initial_mode}")
+
+    # ── Footer ──────────────────────────────────────────────────────
+    print(f"{_GRAY}Type /help for commands, /exit to quit.{_RESET}\n")
+
+    # Show startup nudges if available.
+    if nudge_engine is not None:
+        nudges = nudge_engine.get_nudges()
+        if nudges:
+            print(f"  {_YELLOW}── Nudges ──{_RESET}")
+            for nudge in nudges:
+                print(f"    {_ORANGE}◆{_RESET} {nudge}")
+            print()
+
+    # Load identity content and build system prompt with identity injection.
+    identity_content = None
+    if identity_loader is not None:
+        identity_content = identity_loader.load_all()
+
+    # Build a dict for build_system_prompt's identity parameter.
+    identity_dict = None
+    if identity_content is not None and identity_content.has_any():
+        identity_dict = {
+            "soul": identity_content.soul,
+            "user_merged": identity_content.user_merged,
+            "general": identity_content.general,
+            "agents": identity_content.agents,
+            "memory": identity_content.memory,
+        }
+
+    # Build system prompt with tool descriptions + identity injection.
+    system_prompt = build_system_prompt(tools, identity=identity_dict)
 
     # Conversation history (persists across the session).
     messages: list[dict] = [
@@ -1365,6 +2437,11 @@ def run_repl(
         tools=tools,
         messages=messages,
         session_manager=session_manager,
+        identity_loader=identity_loader,
+        memory_proposal_manager=memory_proposal_manager,
+        skill_proposal_manager=skill_proposal_manager,
+        improvement_proposal_manager=improvement_proposal_manager,
+        nudge_engine=nudge_engine,
         system_prompt=system_prompt,
         rag_engine=rag_engine,
         rag_topk=rag_topk,
@@ -1377,6 +2454,15 @@ def run_repl(
         ideation_engine=ideation_engine,
     )
 
+    # Create session-scoped temporary memory (auto-deletes on exit via atexit).
+    ctx.session_memory = SessionMemory()
+
+    # Propagate session_memory to AgentTool so sub-agents also persist
+    # tool-call progress to the same session store.
+    for tool in tools:
+        if hasattr(tool, "session_memory"):
+            tool.session_memory = ctx.session_memory
+
     # Set initial mode.
     ctx.current_mode = initial_mode
     if initial_mode == "ideate" and ideation_engine is not None:
@@ -1385,8 +2471,12 @@ def run_repl(
         print("Starting in ideation mode. Type /ideate exit to return.\n")
 
     while True:
+        # ── Agent ready indicator ───────────────────────────────────────────
+        # Show the agent name and status before the prompt.
+        _show_agent_ready(ctx)
+
         # Read user input with mode-aware prompt.
-        prompt_label = "Ideate> " if ctx.current_mode == "ideate" else "You> "
+        prompt_label = f"{_ORANGE}Ideate{_RESET}> " if ctx.current_mode == "ideate" else f"{_RED}You{_RESET}> "
         try:
             user_input = input(prompt_label)
         except (EOFError, KeyboardInterrupt):
@@ -1473,6 +2563,10 @@ def run_repl(
         # Build user message and add to history.
         messages.append({"role": "user", "content": prompt_content})
 
+        # ── Visual turn separator: agent name + line ───────────────────────
+        print(f"{_AMBER}{_BOLD}{_AGENT_NAME}{_RESET} {_GREEN}▶{_RESET} {_GRAY}Processing...{_RESET}")
+        print(f"{_RED}{_BOLD}{'─' * 54}{_RESET}")
+
         # Build merged inference options: defaults < presets < user config.
         default_options: dict = {"num_ctx": 8192}
         preset_options = get_model_preset(config.model)
@@ -1501,8 +2595,385 @@ def run_repl(
                 debug=config.debug,
                 options=inference_options,
                 think=think,
+                session_memory=ctx.session_memory,
             )
         except KeyboardInterrupt:
             print("\nInterrupted.")
         except Exception as exc:
             sys.stderr.write(f"Error: {exc}\n")
+
+        # ── Turn footer: status box + nudges + separator ──────────────────
+        # Show the agent status box after each turn.
+        _show_agent_status_box(ctx)
+
+        # Show nudges after status box.
+        if ctx.nudge_engine is not None:
+            nudges = ctx.nudge_engine.get_nudges()
+            if nudges:
+                print(f"  {_YELLOW}── Nudges ──{_RESET}")
+                for nudge in nudges:
+                    print(f"    {_ORANGE}◆{_RESET} {nudge}")
+                print()
+
+        # ── Turn separator line ──────────────────────────────────────────────
+        print(f"{_RED}{_BOLD}{'─' * 54}{_RESET}")
+
+        # ── Auto-session logging ────────────────────────────────────────────
+        # Save every turn to a log file for debugging.
+        log_path = _write_turn_log(messages)
+        if log_path and config.debug:
+            sys.stderr.write(f"[debug] Turn logged: {log_path}\n")
+
+
+# ---------------------------------------------------------------------------
+# Session logging (auto-save every turn)
+# ---------------------------------------------------------------------------
+
+
+_LOG_DIR = ".agents/logs"
+
+
+def _write_turn_log(
+    messages: list[dict],
+    log_dir: str = _LOG_DIR,
+) -> str | None:
+    """Append the latest turn of conversation to a session log file.
+
+    The log is written to ``.agents/logs/<session_timestamp>.jsonl``.
+    Each line is a JSON object with timestamp, role, and a truncated
+    content preview.
+
+    Args:
+        messages: The full conversation message list.
+        log_dir: Directory for log files (default ``.agents/logs``).
+
+    Returns:
+        The log file path, or ``None`` on failure.
+    """
+    try:
+        log_path = Path(log_dir).expanduser()
+        log_path.mkdir(parents=True, exist_ok=True)
+
+        # Use a single session log file per run.
+        session_ts = datetime.now(timezone.utc).strftime("%Y%m%d")
+        log_file = log_path / f"session-{session_ts}.jsonl"
+
+        # Get the last few messages that were just added.
+        # Only log user and assistant messages (not system).
+        new_msgs = [
+            m for m in messages
+            if m.get("role") in ("user", "assistant")
+        ]
+        if not new_msgs:
+            return None
+
+        with open(str(log_file), "a", encoding="utf-8") as fh:
+            for msg in new_msgs[-2:]:  # Log at most the last user+assistant turn
+                entry = {
+                    "ts": datetime.now(timezone.utc).isoformat(),
+                    "role": msg.get("role"),
+                    "content_preview": msg.get("content", "")[:200],
+                    "tool_calls": [
+                        tc.get("function", {}).get("name", "")
+                        for tc in msg.get("tool_calls", [])
+                    ] if msg.get("tool_calls") else None,
+                }
+                fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+        return str(log_file)
+    except OSError:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Log command handler
+# ---------------------------------------------------------------------------
+
+
+def _handle_log_command(parts: list[str], ctx: _ReplContext) -> bool:
+    """Handle /log command — show recent session logs.
+
+    Usage:
+        ``/log`` — list available log files and show the latest 5 entries.
+        ``/log <N>`` — show the last N entries from the latest log file.
+        ``/log list`` — list all available log files.
+        ``/log show <filename>`` — show entries from a specific log file.
+
+    Args:
+        parts: The split command parts (``["/log", ...]``).
+        ctx: The REPL context.
+
+    Returns:
+        True to continue the REPL.
+    """
+    log_dir = ctx.config.agents_dir + "/logs" if hasattr(ctx.config, "agents_dir") else _LOG_DIR
+    log_path = Path(log_dir).expanduser()
+
+    if not log_path.is_dir():
+        print(f"{_YELLOW}No log files found.{_RESET}")
+        print(f"{_GRAY}Session logs are created automatically each time you send a prompt.{_RESET}")
+        return True
+
+    # Collect log files sorted by newest first.
+    try:
+        log_files = sorted(
+            [f for f in log_path.iterdir() if f.suffix == ".jsonl"],
+            key=lambda f: f.stat().st_mtime,
+            reverse=True,
+        )
+    except OSError:
+        print(f"{_RED}Failed to read log directory.{_RESET}")
+        return True
+
+    if not log_files:
+        print(f"{_YELLOW}No log files found.{_RESET}")
+        return True
+
+    subcmd = parts[1].strip().lower() if len(parts) > 1 and parts[1].strip() else ""
+
+    # /log list — list all available log files
+    if subcmd == "list":
+        print(f"\n{_AMBER}{_BOLD}Available log files:{_RESET}")
+        for f in log_files:
+            size = f.stat().st_size
+            mtime = datetime.fromtimestamp(f.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
+            print(f"  {_GREEN}{f.name}{_RESET}  {_GRAY}({size:,} bytes, {mtime}){_RESET}")
+        print(f"\n{_GRAY}Total: {len(log_files)} log file(s){_RESET}")
+        return True
+
+    # /log show <filename> — show entries from a specific file
+    if subcmd == "show":
+        sub_parts = parts[1].strip().split(maxsplit=1)
+        filename = sub_parts[1].strip() if len(sub_parts) > 1 else ""
+        if not filename:
+            print(f"{_ORANGE}Usage:{_RESET} /log show <filename>")
+            return True
+        target = log_path / filename
+        if not target.exists():
+            print(f"{_RED}Log file '{filename}' not found.{_RESET}")
+            return True
+        log_files = [target]
+
+    # Determine how many entries to show.
+    try:
+        n = int(subcmd) if subcmd.isdigit() else 5
+    except (ValueError, AttributeError):
+        n = 5
+
+    # Read from the latest log file.
+    latest = log_files[0]
+    try:
+        lines = latest.read_text(encoding="utf-8").strip().splitlines()
+    except OSError:
+        print(f"{_RED}Failed to read log file.{_RESET}")
+        return True
+
+    if not lines:
+        print(f"{_YELLOW}Log file is empty.{_RESET}")
+        return True
+
+    n = min(n, len(lines))
+    recent = lines[-n:]
+
+    print(f"\n{_RED}{_BOLD}╔═══════════════════════════════════════╗{_RESET}")
+    print(f"{_RED}{_BOLD}║       SESSION LOG                   ║{_RESET}")
+    print(f"{_RED}{_BOLD}╚═══════════════════════════════════════╝{_RESET}")
+    print(f"{_GRAY}File: {latest.name} ({len(lines)} entries, showing last {n}){_RESET}")
+    print()
+
+    for line in recent:
+        try:
+            entry = json.loads(line)
+            ts = entry.get("ts", "?")[11:19]  # HH:MM:SS
+            role = entry.get("role", "?")
+            preview = entry.get("content_preview", "")
+            tool_calls = entry.get("tool_calls")
+
+            role_color = _GREEN if role == "assistant" else _AMBER
+            role_icon = "◀" if role == "user" else "▶"
+
+            print(f"  {_GRAY}[{ts}]{_RESET} {role_color}{role_icon} {role:<10}{_RESET} {preview[:80]}")
+            if tool_calls:
+                print(f"  {_GRAY}     tools: {', '.join(tool_calls)}{_RESET}")
+        except (json.JSONDecodeError, ValueError):
+            continue
+
+    print()
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Heal command handler
+# ---------------------------------------------------------------------------
+
+
+def _handle_heal_command(ctx: _ReplContext) -> bool:
+    """Handle /heal command — scan and self-heal the codebase.
+
+    Runs a syntax and import health scan on all Python files, reports
+    issues found, and attempts auto-fixes with git checkpoint safety.
+
+    Args:
+        ctx: The REPL context.
+
+    Returns:
+        True to continue the REPL.
+    """
+    print(f"\n{_RED}{_BOLD}╔═══════════════════════════════════════╗{_RESET}")
+    print(f"{_RED}{_BOLD}║       SELF-HEAL ENGINE              ║{_RESET}")
+    print(f"{_RED}{_BOLD}╚═══════════════════════════════════════╝{_RESET}\n")
+
+    engine = SelfHealEngine()
+
+    # Phase 1: Scan
+    print(f"{_AMBER}Scanning codebase for issues...{_RESET}")
+    issues = engine.scan()
+
+    if not issues:
+        print(f"{_GREEN}✓ No issues found. Your codebase looks healthy!{_RESET}\n")
+        return True
+
+    print(f"\n{_RED}{_BOLD}Found {len(issues)} issue(s):{_RESET}")
+    for i, issue in enumerate(issues, 1):
+        severity_color = _RED if issue.severity == "error" else _YELLOW
+        print(f"  {severity_color}{i}. [{issue.severity}]{_RESET} {issue.file_path}:{issue.line}")
+        print(f"     {issue.description}")
+        if issue.fix_suggestion:
+            print(f"     {_GRAY}→ {issue.fix_suggestion}{_RESET}")
+
+    # Phase 2: Attempt auto-fix
+    fixable = [i for i in issues if i.severity == "error" and i.fix_suggestion]
+    if fixable:
+        print(f"\n{_ORANGE}Attempting auto-fix for {len(fixable)} issue(s)...{_RESET}")
+        result = engine.heal(fixable, auto_fix=False)
+
+        if result.checkpoint_tag:
+            print(f"  {_GREEN}✓{_RESET} Pre-heal checkpoint: {result.checkpoint_tag}")
+
+        if result.issues_fixed > 0:
+            print(f"  {_GREEN}✓{_RESET} Fixed {result.issues_fixed} issue(s)")
+        if result.issues_failed > 0:
+            print(f"  {_RED}✖{_RESET} Failed to fix {result.issues_failed} issue(s)")
+
+        # Phase 3: Validate
+        print(f"\n{_AMBER}Running validation...{_RESET}")
+        validation_errors = engine.validate()
+        if not validation_errors:
+            print(f"  {_GREEN}✓ Validation passed{_RESET}")
+        else:
+            print(f"  {_RED}✖ {len(validation_errors)} validation error(s):{_RESET}")
+            for err in validation_errors:
+                print(f"     - {err}")
+    else:
+        print(f"\n{_GRAY}No auto-fixable issues found. Review warnings manually.{_RESET}")
+
+    print()
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Structure command handler
+# ---------------------------------------------------------------------------
+
+
+def _handle_structure_command(parts: list[str], ctx: _ReplContext) -> bool:
+    """Handle /structure command — show project directory tree.
+
+    Displays a colorised tree view of the current project structure.
+    Optional depth parameter controls how many levels to show.
+
+    Args:
+        parts: The split command parts (``["/structure", ...]``).
+        ctx: The REPL context.
+
+    Returns:
+        True to continue the REPL.
+    """
+    depth = 3
+    if len(parts) > 1 and parts[1].strip():
+        try:
+            depth = int(parts[1].strip())
+            depth = max(1, min(depth, 6))
+        except ValueError:
+            print(f"{_ORANGE}Usage:{_RESET} /structure [depth]")
+            print(f"  {_GRAY}depth: directory depth level (1-6, default 3){_RESET}")
+            return True
+
+    print(f"\n{_RED}{_BOLD}╔═══════════════════════════════════════╗{_RESET}")
+    print(f"{_RED}{_BOLD}║       PROJECT STRUCTURE              ║{_RESET}")
+    print(f"{_RED}{_BOLD}╚═══════════════════════════════════════╝{_RESET}\n")
+
+    tree = get_project_structure(max_depth=depth)
+    print(tree)
+    print()
+    return True
+
+
+# ----------------------------------------------------------------------
+# Queue, Background, Stop, Interview command handlers
+# ----------------------------------------------------------------------
+
+
+def _handle_queue_command(parts: list[str]) -> bool:
+    """Handle /queue command - queue command to run after current finishes."""
+    from local_cli.stat import _CYAN, _RESET, get_controller
+    
+    ctrl = get_controller()
+    
+    if len(parts) < 2 or not parts[1].strip():
+        print(f"Usage: /queue <command>")
+        print(f"  Queue size: {ctrl.queue_size}")
+        return True
+    
+    command = parts[1].strip()
+    ctrl.queue_command(command)
+    return True
+
+
+def _handle_bg_command(parts: list[str]) -> bool:
+    """Handle /bg command - run command in background mode."""
+    from local_cli.stat import _CYAN, _GREEN, _RESET, get_controller
+    
+    ctrl = get_controller()
+    
+    if len(parts) < 2 or not parts[1].strip():
+        print(f"Usage: /bg <command>")
+        return True
+    
+    command = parts[1].strip()
+    ctrl.start_background(command)
+    return True
+
+
+def _handle_stop_command() -> bool:
+    """Handle /stop command - stop the running agent."""
+    from local_cli.stat import _CYAN, _RED, _RESET, get_controller
+    
+    ctrl = get_controller()
+    ctrl.request_stop()
+    
+    # Also set agent status
+    status = get_status()
+    if status.is_running:
+        status.stop()
+        print(f"{_RED}Agent stopped{_RESET}")
+    else:
+        print(f"No agent running")
+    
+    return True
+
+
+def _handle_interview_command(parts: list[str]) -> bool:
+    """Handle /interview command - start interview mode."""
+    from local_cli.stat import _CYAN, _ORANGE, _RESET, get_controller
+    
+    ctrl = get_controller()
+    project_path = None
+    
+    # Optional project path
+    if len(parts) > 1 and parts[1].strip():
+        project_path = parts[1].strip()
+    
+    intro = ctrl.start_interview(project_path)
+    print(intro)
+    return True

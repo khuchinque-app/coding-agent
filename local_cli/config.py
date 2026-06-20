@@ -7,7 +7,7 @@ import os
 from pathlib import Path
 
 CONFIG_DEFAULTS: dict[str, object] = {
-    "model": "qwen3.5:9b-q4_K_M",
+    "model": "qwen3.5:9b",
     "sidecar_model": "",
     "ollama_host": "http://localhost:11434",
     "state_dir": "~/.local/state/local-cli",
@@ -32,6 +32,13 @@ CONFIG_DEFAULTS: dict[str, object] = {
     "think_mode": False,
     "keep_alive": None,
     "llama_server_url": "http://localhost:8090",
+    # Identity files
+    "agents_dir": ".agents",
+    "auto_init_agents": True,
+    "soul_auto_load": True,
+    "user_auto_load": True,
+    "general_auto_load": True,
+    "memory_auto_load": True,
 }
 
 # Mapping of environment variable names to config keys.
@@ -48,6 +55,7 @@ ENV_VAR_MAP: dict[str, str] = {
     "LOCAL_CLI_THINK_MODE": "think_mode",
     "LOCAL_CLI_KEEP_ALIVE": "keep_alive",
     "LLAMA_SERVER_URL": "llama_server_url",
+    "LOCAL_CLI_AGENTS_DIR": "agents_dir",
 }
 
 # Maximum config file size in bytes (10KB).
@@ -240,6 +248,13 @@ class Config:
         self.think_mode: bool = _parse_bool(merged["think_mode"])
         self.keep_alive: str | None = _parse_optional_str(merged["keep_alive"])
         self.llama_server_url: str = str(merged["llama_server_url"]).rstrip("/")
+        # Identity files
+        self.agents_dir: str = str(merged["agents_dir"])
+        self.auto_init_agents: bool = _parse_bool(merged["auto_init_agents"])
+        self.soul_auto_load: bool = _parse_bool(merged["soul_auto_load"])
+        self.user_auto_load: bool = _parse_bool(merged["user_auto_load"])
+        self.general_auto_load: bool = _parse_bool(merged["general_auto_load"])
+        self.memory_auto_load: bool = _parse_bool(merged["memory_auto_load"])
 
     @property
     def has_claude_access(self) -> bool:

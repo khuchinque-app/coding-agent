@@ -182,6 +182,7 @@ class SubAgent:
         agent_id: str | None = None,
         timeout: float = _DEFAULT_TIMEOUT,
         isolation: str | None = None,
+        session_memory: Any = None,
     ) -> None:
         self._provider = provider
         self._model = model
@@ -191,6 +192,7 @@ class SubAgent:
         self._agent_id = agent_id or self._generate_agent_id()
         self._timeout = timeout
         self._isolation = isolation
+        self._session_memory = session_memory
 
         # Each sub-agent gets its own isolated message list.
         self._messages: list[dict[str, Any]] = []
@@ -285,6 +287,12 @@ class SubAgent:
                     pass
 
         duration = time.monotonic() - start_time
+
+        # Save tool-call progress to session memory (if available).
+        # This allows the main agent loop to see what sub-agents have done
+        # across turns — even after context compaction.
+        if self._session_memory is not None:
+            self._save_sub_agent_progress()
 
         # Clean up worktree; preserve if changes were detected.
         preserved_worktree = ""
@@ -503,6 +511,45 @@ class SubAgent:
         result["message"] = assembled_message
 
         return result
+
+    # ------------------------------------------------------------------
+    # Session memory
+    # ------------------------------------------------------------------
+
+    def _save_sub_agent_progress(self) -> None:
+        """Persist this sub-agent's tool-call history to session memory.
+
+        Extracts tool-call summaries from ``_messages`` and appends them
+        to the session's ``tool_history`` key so the main agent loop can
+        see what sub-agents have done — even after context compaction.
+        """
+        if self._session_memory is None:
+            return
+
+        # Build entries from tool messages in this sub-agent's history.
+        tool_entries: list[dict[str, Any]] = []
+        for msg in self._messages:
+            if msg.get("role") == "tool":
+                tool_name = msg.get("tool_name", "?")
+                content = msg.get("content", "")
+                preview = content.replace("\n", " ").strip()[:120]
+                if len(content) > 120:
+                    preview += "..."
+                tool_entries.append({
+                    "tool_name": tool_name,
+                    "result_preview": preview,
+                })
+
+        if not tool_entries:
+            return
+
+        # Merge with existing history, capped at 50 entries.
+        prior = self._session_memory.load("tool_history", [])
+        merged = list(prior[-50:])
+        merged.extend(tool_entries)
+        if len(merged) > 50:
+            merged = merged[-50:]
+        self._session_memory.save("tool_history", merged)
 
     # ------------------------------------------------------------------
     # Internal helpers

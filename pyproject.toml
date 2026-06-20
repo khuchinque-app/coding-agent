@@ -12,6 +12,10 @@ dependencies = []
 
 [project.scripts]
 local-cli = "local_cli.__main__:main"
+code-agent = "code_agent:main"
 
 [tool.setuptools.packages.find]
 include = ["local_cli*"]
+
+[tool.setuptools]
+py-modules = ["code_agent"]

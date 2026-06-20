@@ -19,7 +19,11 @@ from local_cli.orchestrator import Orchestrator
 from local_cli.plan_manager import PlanManager
 from local_cli.rag import RAGEngine
 from local_cli.security import validate_model_name
+from local_cli.identity import IdentityLoader
+from local_cli.memory_proposals import MemoryProposalManager
+from local_cli.skill_proposals import SkillProposalManager
 from local_cli.skills import SkillsLoader
+from local_cli.self_improvement import ImprovementProposalManager, NudgeEngine
 from local_cli.tools import get_default_tools, get_sub_agent_tools
 
 
@@ -110,6 +114,21 @@ def main() -> None:
         print("Updating...")
         success, update_msg = perform_update()
         print(update_msg)
+        return
+
+    # 2e. Handle --init-agents flag (create agents directory with defaults, then exit).
+    if getattr(args, "init_agents", False):
+        loader = IdentityLoader(
+            agents_dir=config.agents_dir,
+            state_dir=config.state_dir,
+        )
+        created = loader.ensure_agents_dir()
+        if created:
+            print(f"Created {len(created)} file(s) in {config.agents_dir}/:")
+            for fname in created:
+                print(f"  - {fname}")
+        else:
+            print(f"Agents directory {config.agents_dir}/ already exists with all templates.")
         return
 
     # 2d. Background auto-update check on startup.
@@ -297,6 +316,48 @@ def main() -> None:
             f"Warning: Knowledge store initialization failed: {exc}\n"
         )
 
+    # 13b. Initialize identity loader (loads SOUL.md, USER.md, GENERAL.md, etc.).
+    identity_loader: IdentityLoader | None = None
+    try:
+        identity_loader = IdentityLoader(
+            agents_dir=config.agents_dir,
+            state_dir=config.state_dir,
+            auto_init=config.auto_init_agents,
+        )
+        if config.debug:
+            sys.stderr.write(
+                f"[debug] Identity loader initialized: {config.agents_dir}\n"
+            )
+            identity_content = identity_loader.load_all()
+            if identity_content.has_any():
+                sys.stderr.write(
+                    f"[debug] Loaded identity files: "
+                    f"{', '.join(identity_content.loaded_files())}\n"
+                )
+    except Exception as exc:
+        sys.stderr.write(
+            f"Warning: Identity loader initialization failed: {exc}\n"
+        )
+        identity_loader = None
+
+    # 13c. Initialize memory proposal manager.
+    memory_proposal_manager: MemoryProposalManager | None = None
+    try:
+        memory_proposal_manager = MemoryProposalManager(
+            agents_dir=config.agents_dir,
+        )
+        if config.debug:
+            pending = memory_proposal_manager.list_pending()
+            if pending:
+                sys.stderr.write(
+                    f"[debug] {len(pending)} pending memory proposal(s)\n"
+                )
+    except Exception as exc:
+        sys.stderr.write(
+            f"Warning: Memory proposal manager initialization failed: {exc}\n"
+        )
+        memory_proposal_manager = None
+
     # 14. Initialize skills loader and discover skills.
     skills_loader: SkillsLoader | None = None
     try:
@@ -311,6 +372,64 @@ def main() -> None:
         sys.stderr.write(
             f"Warning: Skills loader initialization failed: {exc}\n"
         )
+
+    # 14b. Initialize skill proposal manager.
+    skill_proposal_manager: SkillProposalManager | None = None
+    try:
+        skill_proposal_manager = SkillProposalManager(
+            agents_dir=config.agents_dir,
+        )
+        # Wire a callback to refresh the skills loader on approval.
+        if skills_loader is not None:
+            skill_proposal_manager.set_post_approve_callback(
+                skills_loader.discover_skills
+            )
+        if config.debug:
+            pending = skill_proposal_manager.list_pending()
+            if pending:
+                sys.stderr.write(
+                    f"[debug] {len(pending)} pending skill proposal(s)\n"
+                )
+    except Exception as exc:
+        sys.stderr.write(
+            f"Warning: Skill proposal manager initialization failed: {exc}\n"
+        )
+        skill_proposal_manager = None
+
+    # 14c. Initialize improvement proposal manager.
+    improvement_proposal_manager: ImprovementProposalManager | None = None
+    try:
+        improvement_proposal_manager = ImprovementProposalManager(
+            agents_dir=config.agents_dir,
+        )
+        if config.debug:
+            pending = improvement_proposal_manager.list_pending()
+            if pending:
+                sys.stderr.write(
+                    f"[debug] {len(pending)} pending improvement proposal(s)\n"
+                )
+    except Exception as exc:
+        sys.stderr.write(
+            f"Warning: Improvement proposal manager initialization failed: {exc}\n"
+        )
+        improvement_proposal_manager = None
+
+    # 14d. Initialize nudge engine.
+    nudge_engine: NudgeEngine | None = None
+    try:
+        nudge_engine = NudgeEngine(
+            memory_proposal_manager=memory_proposal_manager,
+            skill_proposal_manager=skill_proposal_manager,
+            improvement_proposal_manager=improvement_proposal_manager,
+            agents_dir=config.agents_dir,
+        )
+        if config.debug:
+            sys.stderr.write("[debug] Nudge engine initialized\n")
+    except Exception as exc:
+        sys.stderr.write(
+            f"Warning: Nudge engine initialization failed: {exc}\n"
+        )
+        nudge_engine = None
 
     # 15. Initialize ideation engine.
     ideation_engine: IdeationEngine | None = None
@@ -342,6 +461,8 @@ def main() -> None:
         config,
         client,
         tools,
+        identity_loader=identity_loader,
+        memory_proposal_manager=memory_proposal_manager,
         rag_engine=rag_engine,
         rag_topk=rag_topk,
         orchestrator=orchestrator,
@@ -349,6 +470,9 @@ def main() -> None:
         sub_agent_runner=sub_agent_runner,
         plan_manager=plan_manager,
         knowledge_store=knowledge_store,
+        skill_proposal_manager=skill_proposal_manager,
+        improvement_proposal_manager=improvement_proposal_manager,
+        nudge_engine=nudge_engine,
         skills_loader=skills_loader,
         ideation_engine=ideation_engine,
         initial_mode=initial_mode,

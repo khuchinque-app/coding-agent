@@ -19,8 +19,8 @@ class AskUserTool(Tool):
     def description(self) -> str:
         return (
             "Ask the user a question and wait for their response. "
-            "Use this when you need clarification, confirmation, or "
-            "additional information to proceed."
+            "Use this when you NEED clarification, confirmation, passwords, "
+            "API keys, or any information from the user. DO NOT guess - ASK instead."
         )
 
     @property

@@ -18,7 +18,8 @@ from local_cli.providers.base import (
     ProviderRequestError,
     ProviderStreamError,
 )
-from local_cli.spinner import Spinner
+from local_cli.session_memory import SessionMemory
+from local_cli.spinner import Spinner, ProgressBar
 from local_cli.token_tracker import TokenTracker
 from local_cli.tool_cache import ToolCache
 from local_cli.tools.base import Tool
@@ -85,7 +86,7 @@ _COMPLEX_KEYWORDS = frozenset({
 
 def collect_streaming_response(
     stream: Generator[dict[str, Any], None, None],
-    spinner: Spinner | None = None,
+    spinner: Spinner | ProgressBar | None = None,
     tracker: TokenTracker | None = None,
 ) -> dict[str, Any]:
     """Accumulate a streaming chat response and print tokens as they arrive.
@@ -851,6 +852,44 @@ def _should_nudge_to_use_tools(
     return True
 
 
+# Simple greetings/acknowledgements that don't imply a coding task.
+# When the user sends one of these and the LLM responds without tool
+# calls, the agent loop breaks naturally instead of injecting "continue"
+# messages.  Each word is matched whole so "add" does not fire on
+# "address".
+_GREETING_WORDS: frozenset[str] = frozenset({
+    "hi", "hello", "hey", "yo", "hai", "howdy", "greetings",
+    "thanks", "thank", "ty", "thx", "thankyou",
+    "ok", "okay", "k", "kk", "sure", "yeah", "yep",
+    "yes", "no", "nope", "nah", "nay",
+    "bye", "goodbye", "cya", "later", "seeya",
+    "nice", "great", "cool", "awesome", "wow",
+    "good", "fine", "well", "gotcha", "understood",
+    "lol", "lmao", "omg", "brb", "gtg",
+})
+
+
+def _is_greeting(user_text: str) -> bool:
+    """Check if the user's text is a simple greeting or acknowledgement.
+
+    Returns ``True`` when the message is short (≤ 6 words) and every
+    word is a known greeting/acknowledgement word — meaning the user
+    is not issuing a task and the loop should not inject continuation
+    messages.
+
+    Args:
+        user_text: The raw user input string.
+
+    Returns:
+        True if the input looks like a simple greeting.
+    """
+    words = user_text.lower().strip().split()
+    if not words or len(words) > 6:
+        return False
+    # Short messages: every word must be a known greeting word.
+    return all(w.strip(".,!?;:") in _GREETING_WORDS for w in words)
+
+
 # Injected (once per turn) when the model answered with code but called no
 # tool on a request that asked for a file change.
 _TOOL_NUDGE_MESSAGE: dict[str, Any] = {
@@ -862,6 +901,62 @@ _TOOL_NUDGE_MESSAGE: dict[str, Any] = {
         "briefly."
     ),
 }
+
+
+# ---------------------------------------------------------------------------
+# Task completion control constants
+# ---------------------------------------------------------------------------
+
+# Completion marker that the LLM must include in its final response
+# when a task is genuinely complete.
+_TASK_COMPLETE_MARKER = "[TASK COMPLETE]"
+
+# Maximum number of times the system will auto-inject a "continue"
+# message before giving up.
+_MAX_CONTINUATIONS = 5
+
+# Minimum number of tool calls before a "task is done" declaration
+# from the LLM is trusted without challenge.
+_MIN_TOOL_CALLS_BEFORE_DONE = 3
+
+# Escalating nudges for code-only responses (no tool calls).
+# Each level is more insistent than the last.
+_TOOL_NUDGE_MESSAGES: list[dict[str, Any]] = [
+    {
+        "role": "user",
+        "content": (
+            "You printed code but did not create or modify any file. If the "
+            "task needs a file written or changed, call the write or edit tool "
+            "now to actually apply it. If no file change is needed, say so "
+            "briefly."
+        ),
+    },
+    {
+        "role": "user",
+        "content": (
+            "You still haven't used any tools to modify files. This task "
+            "requires actual file changes. Please call the write or edit tool "
+            "to make the necessary changes. If you genuinely cannot complete "
+            "this task, explain why."
+        ),
+    },
+    {
+        "role": "user",
+        "content": (
+            "This is your final opportunity to use tools. You MUST call write, "
+            "edit, or bash to complete this task. If you cannot, respond "
+            f"with '{_TASK_COMPLETE_MARKER}' and explain the limitation."
+        ),
+    },
+]
+
+# Template for the "continue" message injected when the LLM stops
+# making tool calls without declaring the task complete.
+_CONTINUE_MESSAGE_TEMPLATE = (
+    "Your response above did not include any tool calls, but the task appears "
+    "to be incomplete. Continue working on the task. If you are truly done, "
+    "respond with '{marker}' at the end of your message."
+)
 
 
 # ---------------------------------------------------------------------------
@@ -879,6 +974,7 @@ def agent_loop(
     tracker: TokenTracker | None = None,
     options: dict[str, Any] | None = None,
     think: bool | None = None,
+    session_memory: SessionMemory | None = None,
 ) -> None:
     """Core agent loop: prompt LLM, execute tool calls, repeat.
 
@@ -894,6 +990,13 @@ def agent_loop(
     Tool result messages include a ``tool_call_id`` field when the tool
     call has an ``id`` (critical for providers like Claude that require
     ``tool_use_id`` in subsequent tool result messages).
+
+    When *session_memory* is provided, the agent loop saves a running
+    summary of every tool call to session storage after each iteration
+    and injects the accumulated summary into the conversation before the
+    first LLM call on subsequent turns.  This allows the model to "see"
+    across REPL turns what it has already done, even when the context
+    window has been compacted.
 
     Args:
         client: An :class:`~local_cli.providers.base.LLMProvider` instance
@@ -919,6 +1022,12 @@ def agent_loop(
             as the ``options`` keyword argument.  If the dict contains a
             ``num_ctx`` key, the context compaction threshold is
             dynamically adjusted to 75% of that value.
+        session_memory: Optional :class:`SessionMemory` instance for
+            persisting tool-call progress across REPL turns.  When
+            provided with prior data, the accumulated tool-call history
+            is injected as a system message at the top of the
+            conversation.  Tool-call summaries are saved after each
+            iteration.  Pass ``None`` to disable (the default).
 
     Raises:
         KeyboardInterrupt: Propagated if the user presses Ctrl+C during
@@ -941,7 +1050,58 @@ def agent_loop(
                 f"(75% of num_ctx={options['num_ctx']})\n"
             )
 
-    nudged = False  # whether we've already nudged "use the tools" this turn
+    # ── Session memory injection ───────────────────────────────────────
+    # If prior tool-call history exists from a previous turn, inject a
+    # system message so the model can see what was already done — even
+    # after context compaction.  Only inject once per session — subsequent
+    # turns skip injection when the SESSION PROGRESS block is already
+    # present to avoid accumulating redundant blocks.
+    if session_memory is not None:
+        prior_calls = session_memory.load("tool_history", [])
+        if prior_calls:
+            # Check if we already have a SESSION PROGRESS block in this
+            # conversation — skip injection if so to avoid duplicates.
+            has_progress_block = any(
+                "--- SESSION PROGRESS ---" in (m.get("content", "") or "")
+                for m in messages
+            )
+            if not has_progress_block:
+                summary_lines = [
+                    "The following tool calls were completed in previous turns "
+                    "of this session. Review them before continuing.",
+                    "",
+                ]
+                for entry in prior_calls:
+                    tool_name = entry.get("tool_name", "?")
+                    result_preview = entry.get("result_preview", "")
+                    summary_lines.append(f"  [{tool_name}] {result_preview}")
+                summary_lines.append("")
+                summary_lines.append(
+                    "Continue working. Do NOT redo completed steps."
+                )
+
+                # Insert after the system prompt but before user messages.
+                system_end = 0
+                for i, msg in enumerate(messages):
+                    if msg.get("role") == "system":
+                        system_end = i + 1
+                    else:
+                        break
+                messages.insert(
+                    system_end,
+                    {
+                        "role": "system",
+                        "content": (
+                            "--- SESSION PROGRESS ---\n"
+                            f"{"".join(summary_lines)}"
+                            "\n--- END SESSION PROGRESS ---"
+                        ),
+                    },
+                )
+
+    nudge_level = 0      # escalation level for tool-use nudges (0, 1, 2)
+    continuation_count = 0  # number of auto-injected "continue" messages
+    prev_had_tool_calls = False  # whether the previous iteration called tools
 
     while True:
         # ---------------------------------------------------------------
@@ -958,7 +1118,7 @@ def agent_loop(
                 f"[debug] Sending {len(messages)} messages to {model}\n"
             )
 
-        thinking_spinner = Spinner("Thinking")
+        thinking_spinner = ProgressBar("Buffy is thinking...")
         thinking_spinner.start()
 
         try:
@@ -1027,11 +1187,123 @@ def agent_loop(
         # ---------------------------------------------------------------
         tool_calls = assistant_message.get("tool_calls", [])
         if not tool_calls:
-            if _should_nudge_to_use_tools(messages, assistant_message, nudged):
-                messages.append(dict(_TOOL_NUDGE_MESSAGE))
-                nudged = True
+            content = assistant_message.get("content", "") or ""
+
+            # ---------------------------------------------------------
+            # Check 1: Explicit completion marker.
+            # The LLM was instructed to include [TASK COMPLETE] when
+            # the task is genuinely done.  Respect that declaration.
+            # ---------------------------------------------------------
+            if _TASK_COMPLETE_MARKER in content:
+                break
+
+            # ---------------------------------------------------------
+            # Check 2: Tool-use nudge (escalating).
+            # Only fires when the LLM printed code fences but didn't
+            # call write or edit.  Uses progressively firmer messages
+            # from _TOOL_NUDGE_MESSAGES.  Re-checks the conditions each
+            # turn (bypasses _should_nudge_to_use_tools which gates on
+            # the already_nudged flag).
+            # ---------------------------------------------------------
+            if "```" in content and _mentions_build_intent(_last_user_text(messages)):
+                if not _wrote_file_this_turn(messages) and nudge_level < len(_TOOL_NUDGE_MESSAGES):
+                    nudge_idx = min(nudge_level, len(_TOOL_NUDGE_MESSAGES) - 1)
+                    messages.append(dict(_TOOL_NUDGE_MESSAGES[nudge_idx]))
+                    nudge_level += 1
+                    continue
+
+            # ---------------------------------------------------------
+            # Check 3: Minimum tool calls.
+            # If the LLM declares "done" / "complete" with suspiciously
+            # few tool calls, challenge it.
+            # ---------------------------------------------------------
+            total_tool_calls = sum(
+                1 for m in messages if m.get("role") == "tool"
+            )
+            content_lower = content.lower()
+            done_phrases = (
+                "task is done", "task is complete", "all done",
+                "finished", "completed", "i'm done", "im done",
+                "that's all", "thats all",
+            )
+            mentions_done = any(p in content_lower for p in done_phrases)
+
+            if mentions_done and total_tool_calls < _MIN_TOOL_CALLS_BEFORE_DONE:
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        f"You've said the task is done but made only "
+                        f"{total_tool_calls} tool call(s). If this is truly "
+                        f"complete, respond with "
+                        f"'{_TASK_COMPLETE_MARKER}'. Otherwise, continue working."
+                    ),
+                })
+                continuation_count += 1
                 continue
+
+            # ---------------------------------------------------------
+            # Guard: Previous round called tools.
+            # If the LLM just completed a tool-use cycle (previous
+            # iteration had tool calls), a no-tool-call response is a
+            # natural summary.  Break without injecting continuation.
+            # ---------------------------------------------------------
+            if prev_had_tool_calls:
+                break
+
+            # ---------------------------------------------------------
+            # Greeting guard: If the user's last message was a simple
+            # greeting/acknowledgement and the LLM responded without
+            # tool calls, accept it as a natural conversation turn.
+            # This prevents the loop from injecting "continue" messages
+            # when the user just says "hi" or "thanks".
+            # ---------------------------------------------------------
+            if _is_greeting(_last_user_text(messages)):
+                break
+
+            # ---------------------------------------------------------
+            # Check 4: Smart continuation.
+            # If the LLM used language hinting at more work ("next",
+            # "continue", "remaining") but made no tool calls, inject
+            # a continuation message.  Capped at _MAX_CONTINUATIONS.
+            # ---------------------------------------------------------
+            if continuation_count < _MAX_CONTINUATIONS:
+                incomplete_hints = (
+                    "next", "now i need", "continue", "the next",
+                    "then i", "remaining", "further", "additionally",
+                    "more", "also", "next step",
+                )
+                has_hints = any(p in content_lower for p in incomplete_hints)
+
+                if has_hints:
+                    messages.append({
+                        "role": "user",
+                        "content": (
+                            f"Your response mentions continuing but made no "
+                            f"tool calls. Use the appropriate tool to proceed. "
+                            f"If the task is truly done, respond with "
+                            f"'{_TASK_COMPLETE_MARKER}'."
+                        ),
+                    })
+                    continuation_count += 1
+                    continue
+
+                # Generic continuation (no specific hints present).
+                messages.append({
+                    "role": "user",
+                    "content": _CONTINUE_MESSAGE_TEMPLATE.format(
+                        marker=_TASK_COMPLETE_MARKER,
+                    ),
+                })
+                continuation_count += 1
+                continue
+
+            # ---------------------------------------------------------
+            # Check 5: Max continuations exceeded.
+            # We've tried _MAX_CONTINUATIONS times; accept the outcome.
+            # ---------------------------------------------------------
             break
+
+        prev_had_tool_calls = bool(tool_calls)
 
         # ---------------------------------------------------------------
         # 4. Execute each tool call and append results.
@@ -1129,8 +1401,87 @@ def agent_loop(
             messages.append(tool_msg)
 
         # ---------------------------------------------------------------
-        # 5. Loop back to send tool results to the LLM.
+        # 5. Save tool-call progress to session memory.
         # ---------------------------------------------------------------
+        if session_memory is not None:
+            _save_session_progress(session_memory, messages)
+
+        # ---------------------------------------------------------------
+        # 6. Loop back to send tool results to the LLM.
+        # ---------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# Session memory helpers
+# ---------------------------------------------------------------------------
+
+
+# Maximum number of entries to keep in session tool history.
+_SESSION_MAX_HISTORY = 50
+
+
+def _save_session_progress(
+    session_memory: SessionMemory,
+    messages: list[dict[str, Any]],
+) -> None:
+    """Extract tool-call history from *messages* and persist it to *session_memory*.
+
+    Scans the message list for tool results, builds a compact summary
+    (tool name + truncated result), and merges it with any prior history
+    stored in the session.  Duplicate entries from the same session turn
+    are avoided by tracking a "last message count" key.
+
+    Args:
+        session_memory: The session storage to write to.
+        messages: The full conversation message list.
+    """
+    # Count tool messages currently in the conversation.
+    current_tool_count = sum(
+        1 for m in messages if m.get("role") == "tool"
+    )
+
+    # Skip if no new tool messages were added since last save.
+    last_saved_count = session_memory.load("_last_tool_count", 0)
+    if current_tool_count <= last_saved_count:
+        return
+
+    # Build entries only for the NEW tool messages.
+    new_entries: list[dict[str, Any]] = []
+    count = 0
+    for msg in reversed(messages):
+        if msg.get("role") == "tool":
+            if count >= (current_tool_count - last_saved_count):
+                break
+            tool_name = msg.get("tool_name", "?")
+            content = msg.get("content", "")
+            preview = content.replace("\n", " ").strip()[:120]
+            if len(content) > 120:
+                preview += "..."
+            new_entries.append({
+                "tool_name": tool_name,
+                "result_preview": preview,
+            })
+            count += 1
+
+    if not new_entries:
+        return
+
+    # Reverse so oldest new entries come first.
+    new_entries.reverse()
+
+    # Merge with existing history.
+    prior_history = session_memory.load("tool_history", [])
+    merged = list(prior_history[-_SESSION_MAX_HISTORY:])
+    # Avoid exact duplicates by checking the last entry.
+    if merged and new_entries and merged[-1] == new_entries[-1]:
+        return
+    merged.extend(new_entries)
+    # Keep under the cap.
+    if len(merged) > _SESSION_MAX_HISTORY:
+        merged = merged[-_SESSION_MAX_HISTORY:]
+
+    session_memory.save("tool_history", merged)
+    session_memory.save("_last_tool_count", current_tool_count)
 
 
 # ---------------------------------------------------------------------------
@@ -1218,6 +1569,7 @@ def sub_agent_loop(
     tools: list[Tool],
     messages: list[dict[str, Any]],
     debug: bool = False,
+    session_memory: SessionMemory | None = None,
 ) -> str:
     """Silent agent loop for sub-agent execution.
 
@@ -1234,6 +1586,11 @@ def sub_agent_loop(
     Returns the final assistant message content string instead of
     ``None``.
 
+    When *session_memory* is provided, tool-call summaries are saved to
+    session storage after each iteration (same ``tool_history`` key used
+    by :func:`agent_loop`), so that spawned agents' progress is visible
+    to the main agent loop.
+
     Args:
         provider: An :class:`~local_cli.providers.base.LLMProvider`
             instance.  Must be a **fresh** instance (not shared with
@@ -1242,6 +1599,8 @@ def sub_agent_loop(
         tools: A list of :class:`Tool` instances available for the LLM.
         messages: The conversation history (mutated in place).
         debug: Unused (kept for signature parity with :func:`agent_loop`).
+        session_memory: Optional :class:`SessionMemory` for persisting
+            tool-call progress.  Pass ``None`` to disable (default).
 
     Returns:
         The final assistant message content string.  Returns an empty
@@ -1249,6 +1608,49 @@ def sub_agent_loop(
     """
     tool_map: dict[str, Tool] = {t.name: t for t in tools}
     tool_defs: list[dict[str, Any]] = provider.format_tools(tools)
+
+    # ── Session memory injection ───────────────────────────────────────
+    # If prior tool-call history exists, inject a SESSION PROGRESS block
+    # so the model can see what was already done — even after compaction.
+    if session_memory is not None:
+        prior_calls = session_memory.load("tool_history", [])
+        if prior_calls:
+            has_progress_block = any(
+                "--- SESSION PROGRESS ---" in (m.get("content", "") or "")
+                for m in messages
+            )
+            if not has_progress_block:
+                summary_lines = [
+                    "The following tool calls were completed in previous turns "
+                    "of this session. Review them before continuing.",
+                    "",
+                ]
+                for entry in prior_calls:
+                    tool_name = entry.get("tool_name", "?")
+                    result_preview = entry.get("result_preview", "")
+                    summary_lines.append(f"  [{tool_name}] {result_preview}")
+                summary_lines.append("")
+                summary_lines.append(
+                    "Continue working. Do NOT redo completed steps."
+                )
+
+                system_end = 0
+                for i, msg in enumerate(messages):
+                    if msg.get("role") == "system":
+                        system_end = i + 1
+                    else:
+                        break
+                messages.insert(
+                    system_end,
+                    {
+                        "role": "system",
+                        "content": (
+                            "--- SESSION PROGRESS ---\n"
+                            f"{"".join(summary_lines)}"
+                            "\n--- END SESSION PROGRESS ---"
+                        ),
+                    },
+                )
 
     final_content = ""
 
@@ -1337,7 +1739,13 @@ def sub_agent_loop(
             messages.append(tool_msg)
 
         # ---------------------------------------------------------------
-        # 5. Loop back to send tool results to the LLM.
+        # 5. Save tool-call progress to session memory.
+        # ---------------------------------------------------------------
+        if session_memory is not None:
+            _save_session_progress(session_memory, messages)
+
+        # ---------------------------------------------------------------
+        # 6. Loop back to send tool results to the LLM.
         # ---------------------------------------------------------------
 
     return final_content
@@ -1454,7 +1862,7 @@ def ideation_loop(
         KeyboardInterrupt: Propagated if the user presses Ctrl+C before
             streaming starts.
     """
-    thinking_spinner = Spinner("Thinking")
+    thinking_spinner = ProgressBar("Buffy is thinking...")
     thinking_spinner.start()
 
     try:
@@ -1486,7 +1894,7 @@ def ideation_loop(
                 "Model does not support thinking mode, "
                 "falling back to standard generation\n"
             )
-            thinking_spinner = Spinner("Thinking")
+            thinking_spinner = ProgressBar("Buffy is thinking...")
             thinking_spinner.start()
             try:
                 stream = client.chat_stream(model, messages)

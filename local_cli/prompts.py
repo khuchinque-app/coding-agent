@@ -14,17 +14,55 @@ that.
 """
 
 import os
+from typing import Any
 
 from local_cli.tools.base import Tool
 
 
-def build_system_prompt(tools: list[Tool]) -> str:
+def _wrap_identity_section(label: str, content: str) -> str:
+    """Wrap an identity file's content with a labelled header/footer.
+
+    Args:
+        label: Short label for the section (e.g. ``"SOUL"``, ``"USER"``).
+        content: The raw markdown content of the identity file.
+
+    Returns:
+        A wrapped block ready for injection into the system prompt.
+    """
+    return (
+        f"--- {label} ---\n"
+        f"{content.strip()}\n"
+        f"--- END {label} ---"
+    )
+
+
+def build_system_prompt(
+    tools: list[Tool],
+    identity: dict[str, Any] | None = None,
+) -> str:
     """Build the agent system prompt, including a description of *tools*.
+
+    When *identity* is provided, identity files are injected in the
+    following layering order (highest priority first):
+
+    1. SOUL.md — agent personality & identity
+    2. GENERAL.md — context/instructions
+    3. USER.md — user profile & preferences
+    4. AGENTS.md — project-level context
+
+    Each file is wrapped with clear ``--- LABEL ---`` / ``--- END LABEL ---``
+    delimiters so the model can distinguish identity context from the main
+    system prompt.
 
     Args:
         tools: The tool instances available to the agent.  Each tool's
             name and description are listed so the model knows what it
             can call.
+        identity: Optional dict of loaded identity content, as returned by
+            :meth:`~local_cli.identity.IdentityLoader.load_all`.  Expected
+            keys: ``soul``, ``user_merged``, ``general``, ``agents``,
+            ``memory``.  Values are strings or ``None``.  Pass ``None`` or
+            an empty dict to build the prompt without identity injection.
 
     Returns:
         The full system prompt string.
@@ -32,7 +70,38 @@ def build_system_prompt(tools: list[Tool]) -> str:
     tool_section = "\n".join(f"- {t.name}: {t.description}" for t in tools)
     cwd = os.getcwd()
 
-    return (
+    # Build identity sections in layering order.
+    identity_parts: list[str] = []
+    identity = identity or {}
+
+    # 1. SOUL.md — agent personality (highest priority).
+    soul_content = identity.get("soul")
+    if soul_content:
+        identity_parts.append(_wrap_identity_section("SOUL", soul_content))
+
+    # 2. GENERAL.md — context/instructions.
+    general_content = identity.get("general")
+    if general_content:
+        identity_parts.append(_wrap_identity_section("GENERAL", general_content))
+
+    # 3. USER.md — user profile & preferences (merged global + local).
+    user_content = identity.get("user_merged")
+    if user_content:
+        identity_parts.append(_wrap_identity_section("USER", user_content))
+
+    # 4. AGENTS.md — project-level context.
+    agents_content = identity.get("agents")
+    if agents_content:
+        identity_parts.append(_wrap_identity_section("AGENTS", agents_content))
+
+    # 5. MEMORY.md — agent-curated notes (auto-injected when present).
+    memory_content = identity.get("memory")
+    if memory_content:
+        identity_parts.append(_wrap_identity_section("MEMORY", memory_content))
+
+    identity_block = "\n\n".join(identity_parts)
+
+    base_prompt = (
         "You are a coding agent — an autonomous AI assistant that completes tasks by "
         "using tools. You operate in an agent loop: think about what to do, use a tool, "
         "observe the result, then decide the next step. Continue until the task is fully done.\n\n"
@@ -95,4 +164,36 @@ def build_system_prompt(tools: list[Tool]) -> str:
         "can be answered by running a command or reading a file, ALWAYS use a tool "
         "(bash, read, glob, grep) to get the real answer. NEVER guess or say "
         "'I cannot access your system'. You ARE running on their system.\n"
+        "11. CRITICAL: When a task is fully complete, include \"[TASK COMPLETE]\" at "
+        "the very end of your response. Do NOT add this marker if the task is only "
+        "partially done or if there is more work remaining. This marker tells the "
+        "system that execution is finished. Without it, the system will assume your "
+        "work is incomplete and will ask you to continue.\n"
+        "12. SESSION PROGRESS block: At the start of a new turn, the system may "
+        "inject a SESSION PROGRESS block into the conversation (wrapped with "
+        "--- SESSION PROGRESS --- / --- END SESSION PROGRESS --- markers). "
+        "This block lists tool calls that were completed in previous turns "
+        "of the same session (e.g. files read, written, or commands run). "
+        "Review this block carefully before starting any new work. "
+        "Do NOT redo steps that are already listed as completed. "
+        "The block is injected automatically -- you do not need to request it.\n"
+        "\n"
+        "ASKING FOR HELP (IMPORTANT):\n"
+        "You should NOT hesitate to ask the user for help when needed. Use the "
+        "ask_user tool to get clarification or information:\n"
+        "- If you need a password, API key, token, or secret: ASK using ask_user.\n"
+        "- If something is unclear: ASK using ask_user. Don't guess.\n"
+        "- If you need confirmation before doing something risky: ASK using ask_user.\n"
+        "- If you need the user to provide information: ASK using ask_user.\n"
+        "Examples of when to ask:\n"
+        "- 'I need your API key to connect to the service. Please enter it:'\n"
+        "- 'Which file do you want me to modify? I found multiple candidates.'\n"
+        "- 'This will delete files. Continue? (yes/no)'\n"
+        "- 'What do you mean by \"optimize\"? Faster execution or smaller size?'\n"
     )
+
+    # Append identity block at the end of the built-in prompt.
+    if identity_block:
+        return base_prompt + "\n\n--- IDENTITY ---\n\n" + identity_block
+
+    return base_prompt

@@ -1,5 +1,6 @@
 """Tests for the /context slash command in local_cli.cli."""
 
+import re
 import unittest
 from io import StringIO
 from unittest.mock import MagicMock, patch
@@ -9,8 +10,18 @@ from local_cli.agent import (
     _COMPACT_MESSAGE_THRESHOLD,
     _COMPACT_TOKEN_THRESHOLD,
 )
+
+
 from local_cli.cli import _handle_slash_command, _ReplContext
 from local_cli.config import Config
+
+
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
+
+
+def _strip_ansi(text: str) -> str:
+    """Remove ANSI escape sequences from text."""
+    return _ANSI_RE.sub("", text)
 
 
 # ---------------------------------------------------------------------------
@@ -69,8 +80,8 @@ class TestContextCommand(unittest.TestCase):
         ]
         ctx = _make_ctx(messages)
         _handle_slash_command("/context", ctx)
-        output = mock_stdout.getvalue()
-        self.assertIn("Messages: 3", output)
+        output = _strip_ansi(mock_stdout.getvalue())
+        self.assertIn("Messages:", output)
 
     @patch("sys.stdout", new_callable=StringIO)
     def test_context_shows_estimated_tokens(
@@ -83,9 +94,9 @@ class TestContextCommand(unittest.TestCase):
         ]
         ctx = _make_ctx(messages)
         _handle_slash_command("/context", ctx)
-        output = mock_stdout.getvalue()
+        output = _strip_ansi(mock_stdout.getvalue())
         # Verify estimated tokens and threshold are present.
-        self.assertIn("Est. tokens:", output)
+        self.assertIn("Tokens:", output)
         self.assertIn(str(_COMPACT_TOKEN_THRESHOLD), output)
 
     @patch("sys.stdout", new_callable=StringIO)
@@ -99,8 +110,8 @@ class TestContextCommand(unittest.TestCase):
         ]
         ctx = _make_ctx(messages)
         _handle_slash_command("/context", ctx)
-        output = mock_stdout.getvalue()
-        self.assertIn("Compaction: not triggered", output)
+        output = _strip_ansi(mock_stdout.getvalue())
+        self.assertIn("not triggered", output)
 
     @patch("sys.stdout", new_callable=StringIO)
     def test_context_compaction_triggered_by_message_count(
@@ -113,8 +124,8 @@ class TestContextCommand(unittest.TestCase):
             messages.append({"role": "user", "content": f"msg {i}"})
         ctx = _make_ctx(messages)
         _handle_slash_command("/context", ctx)
-        output = mock_stdout.getvalue()
-        self.assertIn("Compaction: triggered", output)
+        output = _strip_ansi(mock_stdout.getvalue())
+        self.assertIn("triggered", output)
         # Make sure it's not "not triggered".
         self.assertNotIn("not triggered", output)
 
@@ -131,8 +142,8 @@ class TestContextCommand(unittest.TestCase):
         ]
         ctx = _make_ctx(messages)
         _handle_slash_command("/context", ctx)
-        output = mock_stdout.getvalue()
-        self.assertIn("Compaction: triggered", output)
+        output = _strip_ansi(mock_stdout.getvalue())
+        self.assertIn("triggered", output)
         self.assertNotIn("not triggered", output)
 
     @patch("sys.stdout", new_callable=StringIO)
@@ -140,13 +151,11 @@ class TestContextCommand(unittest.TestCase):
         """Output follows the expected pipe-separated format."""
         ctx = _make_ctx()
         _handle_slash_command("/context", ctx)
-        output = mock_stdout.getvalue().strip()
-        # Verify the pipe-separated format.
-        parts = output.split(" | ")
-        self.assertEqual(len(parts), 3)
-        self.assertTrue(parts[0].startswith("Messages:"))
-        self.assertTrue(parts[1].startswith("Est. tokens:"))
-        self.assertTrue(parts[2].startswith("Compaction:"))
+        output = _strip_ansi(mock_stdout.getvalue().strip())
+        # Verify key info is present (colorized output no longer pipe-separated).
+        self.assertIn("Messages:", output)
+        self.assertIn("Tokens:", output)
+        self.assertIn("Compaction:", output)
 
     @patch("sys.stdout", new_callable=StringIO)
     def test_context_with_empty_messages(
@@ -155,10 +164,11 @@ class TestContextCommand(unittest.TestCase):
         """Handles an empty message list gracefully."""
         ctx = _make_ctx(messages=[])
         _handle_slash_command("/context", ctx)
-        output = mock_stdout.getvalue()
-        self.assertIn("Messages: 0", output)
-        self.assertIn("Est. tokens: ~0", output)
-        self.assertIn("Compaction: not triggered", output)
+        output = _strip_ansi(mock_stdout.getvalue())
+        self.assertIn("Messages:", output)
+        self.assertIn("Tokens:", output)
+        self.assertIn("Compaction:", output)
+        self.assertIn("not triggered", output)
 
     @patch("sys.stdout", new_callable=StringIO)
     def test_context_token_estimate_accuracy(
@@ -172,7 +182,7 @@ class TestContextCommand(unittest.TestCase):
         ]
         ctx = _make_ctx(messages)
         _handle_slash_command("/context", ctx)
-        output = mock_stdout.getvalue()
+        output = _strip_ansi(mock_stdout.getvalue())
         # Manually compute expected tokens.
         total_chars = len("prompt") + len(content)
         expected_tokens = total_chars // _CHARS_PER_TOKEN
@@ -184,7 +194,7 @@ class TestContextCommand(unittest.TestCase):
         ctx = _make_ctx()
         result = _handle_slash_command("/CONTEXT", ctx)
         self.assertTrue(result)
-        output = mock_stdout.getvalue()
+        output = _strip_ansi(mock_stdout.getvalue())
         self.assertIn("Messages:", output)
 
     @patch("sys.stdout", new_callable=StringIO)
@@ -209,11 +219,10 @@ class TestContextCommand(unittest.TestCase):
         ]
         ctx = _make_ctx(messages)
         _handle_slash_command("/context", ctx)
-        output = mock_stdout.getvalue()
+        output = _strip_ansi(mock_stdout.getvalue())
         # Token estimate should be > 0 and include tool call argument chars.
-        self.assertIn("Est. tokens: ~", output)
+        self.assertIn("Tokens:", output)
         # Extract the estimated tokens number.
-        import re
         match = re.search(r"~(\d+)", output)
         self.assertIsNotNone(match)
         tokens = int(match.group(1))

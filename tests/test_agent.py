@@ -485,7 +485,7 @@ class TestAgentLoopNoToolCalls(unittest.TestCase):
     def test_simple_response_appended_to_messages(self) -> None:
         """LLM response without tool calls appends assistant message and exits."""
         client = MagicMock()
-        chunks = _make_chunks(["Hello!"])
+        chunks = _make_chunks(["Hello! [TASK COMPLETE]"])
         client.chat_stream.return_value = iter(chunks)
 
         messages: list[dict[str, Any]] = [
@@ -496,12 +496,12 @@ class TestAgentLoopNoToolCalls(unittest.TestCase):
         # Assistant message should have been appended.
         self.assertEqual(len(messages), 2)
         self.assertEqual(messages[1]["role"], "assistant")
-        self.assertEqual(messages[1]["content"], "Hello!")
+        self.assertEqual(messages[1]["content"], "Hello! [TASK COMPLETE]")
 
     def test_no_tool_calls_means_single_iteration(self) -> None:
         """Without tool calls, chat_stream is called exactly once."""
         client = MagicMock()
-        chunks = _make_chunks(["Done."])
+        chunks = _make_chunks(["Done. [TASK COMPLETE]"])
         client.chat_stream.return_value = iter(chunks)
 
         messages: list[dict[str, Any]] = [
@@ -534,7 +534,7 @@ class TestAgentLoopWithToolCalls(unittest.TestCase):
         first_chunks = _make_chunks([""], tool_calls=tc)
 
         # Second call: LLM responds without tool calls.
-        second_chunks = _make_chunks(["I read the file."])
+        second_chunks = _make_chunks(["I read the file. [TASK COMPLETE]"])
 
         client = MagicMock()
         client.chat_stream.side_effect = [
@@ -556,7 +556,7 @@ class TestAgentLoopWithToolCalls(unittest.TestCase):
         self.assertEqual(messages[2]["tool_name"], "read")
         self.assertEqual(messages[2]["content"], "file content here")
         self.assertEqual(messages[3]["role"], "assistant")
-        self.assertEqual(messages[3]["content"], "I read the file.")
+        self.assertEqual(messages[3]["content"], "I read the file. [TASK COMPLETE]")
 
     def test_multiple_tool_calls_in_single_response(self) -> None:
         """LLM requests multiple tool calls in a single response."""
@@ -568,7 +568,7 @@ class TestAgentLoopWithToolCalls(unittest.TestCase):
             {"function": {"name": "write", "arguments": {}}},
         ]
         first_chunks = _make_chunks([""], tool_calls=tc)
-        second_chunks = _make_chunks(["All done."])
+        second_chunks = _make_chunks(["All done. [TASK COMPLETE]"])
 
         client = MagicMock()
         client.chat_stream.side_effect = [
@@ -601,7 +601,7 @@ class TestAgentLoopWithToolCalls(unittest.TestCase):
         chunks2 = _make_chunks([""], tool_calls=tc2)
 
         # Round 3: final text response.
-        chunks3 = _make_chunks(["Done."])
+        chunks3 = _make_chunks(["Done. [TASK COMPLETE]"])
 
         client = MagicMock()
         client.chat_stream.side_effect = [
@@ -637,7 +637,7 @@ class TestAgentLoopErrorHandling(unittest.TestCase):
         """Calling an unknown tool appends an error tool message."""
         tc = [{"function": {"name": "nonexistent", "arguments": {}}}]
         first_chunks = _make_chunks([""], tool_calls=tc)
-        second_chunks = _make_chunks(["I see the error."])
+        second_chunks = _make_chunks(["I see the error. [TASK COMPLETE]"])
 
         client = MagicMock()
         client.chat_stream.side_effect = [
@@ -666,7 +666,7 @@ class TestAgentLoopErrorHandling(unittest.TestCase):
 
         tc = [{"function": {"name": "failing", "arguments": {}}}]
         first_chunks = _make_chunks([""], tool_calls=tc)
-        second_chunks = _make_chunks(["Noted the error."])
+        second_chunks = _make_chunks(["Noted the error. [TASK COMPLETE]"])
 
         client = MagicMock()
         client.chat_stream.side_effect = [
@@ -831,7 +831,7 @@ class TestAgentLoopCacheHit(unittest.TestCase):
         # LLM calls the read tool.
         tc = [{"function": {"name": "read", "arguments": args}}]
         first_chunks = _make_chunks([""], tool_calls=tc)
-        second_chunks = _make_chunks(["Done."])
+        second_chunks = _make_chunks(["Done. [TASK COMPLETE]"])
 
         client = MagicMock()
         client.chat_stream.side_effect = [
@@ -999,7 +999,7 @@ class TestAgentLoopCacheMiss(unittest.TestCase):
         chunks2 = _make_chunks([""], tool_calls=tc2)
 
         # Round 3: final text response.
-        chunks3 = _make_chunks(["All done."])
+        chunks3 = _make_chunks(["All done. [TASK COMPLETE]"])
 
         client = MagicMock()
         client.chat_stream.side_effect = [
@@ -1494,7 +1494,7 @@ class TestAgentLoopThinkingAndOptions(unittest.TestCase):
     def test_agent_loop_with_options(self) -> None:
         """Options dict is passed through to client.chat_stream."""
         client = MagicMock()
-        chunks = _make_chunks(["Done."])
+        chunks = _make_chunks(["Done. [TASK COMPLETE]"])
         client.chat_stream.return_value = iter(chunks)
 
         messages: list[dict[str, Any]] = [
@@ -1552,7 +1552,7 @@ class TestAgentLoopThinkingAndOptions(unittest.TestCase):
 def _dummy_stream_chunks() -> list[dict[str, Any]]:
     """Return minimal streaming chunks that make agent_loop complete."""
     return [
-        {"message": {"role": "assistant", "content": "Done."}, "done": True},
+        {"message": {"role": "assistant", "content": "Done. [TASK COMPLETE]"}, "done": True},
     ]
 
 
@@ -1987,8 +1987,8 @@ class TestAgentLoopNudge(unittest.TestCase):
 
     def test_nudges_then_completes(self) -> None:
         client = MagicMock()
-        chunks1 = _make_chunks(["```python\nprint(1)\n```"])  # code, no tool
-        chunks2 = _make_chunks(["No file change needed."])     # plain → done
+        chunks1 = _make_chunks(["```python\nprint(1)\n```"])  # code, no tool — no marker yet, so nudge fires
+        chunks2 = _make_chunks(["No file change needed. [TASK COMPLETE]"])     # plain → done with marker
         client.chat_stream.side_effect = [iter(chunks1), iter(chunks2)]
 
         messages: list[dict[str, Any]] = [
@@ -2005,7 +2005,7 @@ class TestAgentLoopNudge(unittest.TestCase):
 
     def test_no_nudge_on_plain_explanation(self) -> None:
         client = MagicMock()
-        chunks1 = _make_chunks(["```python\nprint(1)\n```"])
+        chunks1 = _make_chunks(["```python\nprint(1)\n```\n[TASK COMPLETE]"])
         client.chat_stream.side_effect = [iter(chunks1)]
 
         messages: list[dict[str, Any]] = [
@@ -2019,6 +2019,125 @@ class TestAgentLoopNudge(unittest.TestCase):
         ]
         self.assertEqual(len(nudges), 0)
         self.assertEqual(client.chat_stream.call_count, 1)
+
+
+# ---------------------------------------------------------------------------
+# _is_greeting
+# ---------------------------------------------------------------------------
+
+
+class TestIsGreeting(unittest.TestCase):
+    """Tests for _is_greeting()."""
+
+    def test_simple_hi(self) -> None:
+        from local_cli.agent import _is_greeting
+        self.assertTrue(_is_greeting("hi"))
+
+    def test_hello(self) -> None:
+        from local_cli.agent import _is_greeting
+        self.assertTrue(_is_greeting("hello"))
+
+    def test_thanks(self) -> None:
+        from local_cli.agent import _is_greeting
+        self.assertTrue(_is_greeting("thanks"))
+
+    def test_okay(self) -> None:
+        from local_cli.agent import _is_greeting
+        self.assertTrue(_is_greeting("ok"))
+
+    def test_multiple_words_all_greetings(self) -> None:
+        from local_cli.agent import _is_greeting
+        self.assertTrue(_is_greeting("hi hello thanks"))
+
+    def test_with_punctuation(self) -> None:
+        from local_cli.agent import _is_greeting
+        self.assertTrue(_is_greeting("hi! hello! thanks!"))
+
+    def test_task_word_not_greeting(self) -> None:
+        from local_cli.agent import _is_greeting
+        self.assertFalse(_is_greeting("create"))
+
+    def test_short_task_not_greeting(self) -> None:
+        from local_cli.agent import _is_greeting
+        self.assertFalse(_is_greeting("fix bug"))
+
+    def test_long_mixed_not_greeting(self) -> None:
+        from local_cli.agent import _is_greeting
+        self.assertFalse(_is_greeting("hi can you create a file for me"))
+
+    def test_empty_not_greeting(self) -> None:
+        from local_cli.agent import _is_greeting
+        self.assertFalse(_is_greeting(""))
+
+
+# ---------------------------------------------------------------------------
+# Agent loop: greeting guard
+# ---------------------------------------------------------------------------
+
+
+class TestAgentLoopGreetingGuard(unittest.TestCase):
+    """Integration: agent_loop exits after 1 iteration on simple greetings."""
+
+    def setUp(self) -> None:
+        self._orig_stdout = sys.stdout
+        self._orig_stderr = sys.stderr
+        sys.stdout = StringIO()
+        sys.stderr = StringIO()
+
+    def tearDown(self) -> None:
+        sys.stdout = self._orig_stdout
+        sys.stderr = self._orig_stderr
+
+    def test_hi_does_not_loop(self) -> None:
+        """Saying 'hi' results in a single LLM call (no continuation loop)."""
+        client = MagicMock()
+        # LLM responds with a greeting — no [TASK COMPLETE], no tools.
+        chunks = _make_chunks(["Hello! How can I help you today?"])
+        client.chat_stream.return_value = iter(chunks)
+
+        messages: list[dict[str, Any]] = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "hi"},
+        ]
+        agent_loop(client, "m", [], messages)
+
+        # Only 1 LLM call — the greeting guard breaks before injecting
+        # a continuation message.
+        client.chat_stream.assert_called_once()
+        self.assertEqual(len(messages), 3)  # system + user + assistant
+
+    def test_thanks_does_not_loop(self) -> None:
+        """Saying 'thanks' results in a single LLM call."""
+        client = MagicMock()
+        chunks = _make_chunks(["You're welcome!"])
+        client.chat_stream.return_value = iter(chunks)
+
+        messages: list[dict[str, Any]] = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "thanks"},
+        ]
+        agent_loop(client, "m", [], messages)
+
+        client.chat_stream.assert_called_once()
+
+    def test_short_task_still_loops_once(self) -> None:
+        """A short task word like 'create' still works (not blocked by guard)."""
+        client = MagicMock()
+        # LLM responds without tools — continuation kicks in once.
+        chunks1 = _make_chunks(["Here's the code:\n```python\nx=1\n```"])
+        chunks2 = _make_chunks(["Done. [TASK COMPLETE]"])
+        client.chat_stream.side_effect = [
+            iter(chunks1), iter(chunks2),
+        ]
+
+        messages: list[dict[str, Any]] = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "create"},
+        ]
+        agent_loop(client, "m", [], messages)
+
+        # Should have done 2 LLM calls (code fence triggers nudge).
+        self.assertEqual(client.chat_stream.call_count, 2)
 
 
 class TestAgentLoopAliasIntegration(unittest.TestCase):
