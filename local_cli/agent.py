@@ -803,8 +803,14 @@ def _mentions_build_intent(user_text: str) -> bool:
 
 
 def _last_user_text(messages: list[dict[str, Any]]) -> str:
-    """Return the content of the most recent user message (or '')."""
-    for msg in reversed(messages):
+    """Return the content of the original user message (or '').
+
+    Skips injected system messages (continuation prompts) to get the
+    actual last message from the user, not the auto-injected ones.
+    """
+    # Find the first user message, skipping any system-injected continuations
+    # that were added after the original user input.
+    for msg in messages:
         if msg.get("role") == "user":
             return msg.get("content", "") or ""
     return ""
@@ -1093,7 +1099,7 @@ def agent_loop(
                         "role": "system",
                         "content": (
                             "--- SESSION PROGRESS ---\n"
-                            f"{"".join(summary_lines)}"
+                            f"{''.join(summary_lines)}"
                             "\n--- END SESSION PROGRESS ---"
                         ),
                     },
@@ -1646,7 +1652,7 @@ def sub_agent_loop(
                         "role": "system",
                         "content": (
                             "--- SESSION PROGRESS ---\n"
-                            f"{"".join(summary_lines)}"
+                            f"{''.join(summary_lines)}"
                             "\n--- END SESSION PROGRESS ---"
                         ),
                     },
